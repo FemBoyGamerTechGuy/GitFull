@@ -24,6 +24,15 @@ pub enum GitfullError {
         program: String,
         reason: String,
     },
+    /// A state-changing operation was attempted without root while gitfull
+    /// operates on system paths (`/var/lib/gitfull` and/or a system-wide
+    /// bin dir). Mutating commands must run as root (sudo); read-only
+    /// commands (list, info, doctor, config, audit) stay unprivileged.
+    Privilege {
+        cmd: String,
+        root: PathBuf,
+        bin_dir: PathBuf,
+    },
     Toolchain {
         component: String,
         message: String,
@@ -53,6 +62,15 @@ impl fmt::Display for GitfullError {
                  gitfull never invokes host package managers or privilege escalators; \
                  all dependency resolution is performed internally by gitfull. \
                  See docs/AUDIT.md."
+            ),
+            GitfullError::Privilege { cmd, root, bin_dir } => write!(
+                f,
+                "root required: `{cmd}` writes to {r} and installs binaries \
+                 into {b}, which a normal user cannot do. Re-run it as root: \
+                 `sudo gitfull {cmd} ...`. Read-only commands (list, info, \
+                 doctor, config, audit) do not need root.",
+                r = root.display(),
+                b = bin_dir.display(),
             ),
             GitfullError::Toolchain { component, message } => {
                 write!(f, "toolchain[{component}]: {message}")

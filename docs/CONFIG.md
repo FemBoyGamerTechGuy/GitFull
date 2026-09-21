@@ -28,6 +28,13 @@ Design principles:
 | `host_tool_path` | string | `/usr/bin:/bin` | POSIX utilities available to in-sandbox builds (see docs/AUDIT.md §4; point at a busybox toolchain for full strictness) |
 | `color` | string | `"auto"` | progress-bar colors: `auto` \| `always` \| `never` |
 
+**Privilege note:** while either `root` or `bin_dir` keeps its system
+default, all state-changing commands (`install`, `update`, `remove`,
+`toolchain … --execute`) require root — `sudo gitfull …` (see
+privilege.rs and docs/AUDIT.md §2.0). Overriding **both** away from the
+system defaults switches to an explicit dev mode where mutating commands
+run unprivileged (this is what the test suite uses).
+
 ## 2. `[forge]` — the forge registry
 
 ```toml
@@ -40,6 +47,9 @@ host           = "github.com"
 scheme         = "https"    # default https
 port           = 3000       # optional
 clone_template = "https://{host}/src/{owner}/{repo}.git"   # optional
+api_base       = "https://git.corp.example.com/api/v1"      # optional: search API base
+                            # (derived from kind when absent; cgit/generic forges
+                            #  without one are skipped by ranked search)
 token_env      = "GITFULL_TOKEN"    # optional: env var name for a read token
 ```
 
@@ -53,6 +63,14 @@ token_env      = "GITFULL_TOKEN"    # optional: env var name for a read token
   errors (fail loudly).
 * **`generic` + template covers any forge** — cgit, cgit-fe, private
   mirrors, future forges: zero code changes, now or later.
+* `api_base` (optional) is the REST base used by **ranked search** — the
+  `install <name>` bare-name path. It is derived from `kind` for the
+  known kinds (`https://api.github.com`, `https://<host>/api/v4`,
+  `https://<host>/api/v1`); set it explicitly for forges behind a proxy
+  or with a nonstandard layout. Queries are unauthenticated read-only
+  GETs — `token_env` is deliberately NOT used for search. A forge
+  without a derivable `api_base` (cgit, generic without one) is skipped
+  with a visible note when a bare name is installed.
 * Unknown keys inside a forge entry are accepted and ignored
   (forward compatibility for future forge features).
 * The name `default` is reserved (it collides with the scalar

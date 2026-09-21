@@ -47,7 +47,8 @@ pub struct ForgeDef {
     /// Required for kinds gitfull has no built-in URL rule for.
     #[serde(default)]
     pub clone_template: Option<String>,
-    /// Reserved for future metadata lookups; not used in v0.1.
+    /// REST API base override for search/ranking queries (see
+    /// [`Forge::api_base`]). Optional — derived from the kind when absent.
     #[serde(default)]
     pub api_base: Option<String>,
     /// Name of the environment variable holding an optional read token for
@@ -86,6 +87,36 @@ impl Forge {
     }
     pub fn token_env(&self) -> Option<&str> {
         self.def.token_env.as_deref()
+    }
+
+    /// Base URL of the forge's REST API, used ONLY for the read-only
+    /// search/ranking queries in [`crate::search`].
+    ///
+    /// * explicit `api_base` in the forge entry wins (also lets tests
+    ///   point a forge at a local fixture server);
+    /// * else derived from the kind: GitHub → `https://api.github.com`,
+    ///   GitLab → `https://<host>/api/v4`, Gitea/Forgejo →
+    ///   `https://<host>/api/v1`;
+    /// * `cgit`/unknown kinds without an `api_base` have no search API →
+    ///   `None` (that forge is skipped during ranked search).
+    pub fn api_base(&self) -> Option<String> {
+        if let Some(base) = &self.def.api_base {
+            let base = base.trim_end_matches('/');
+            if !base.is_empty() {
+                return Some(base.to_string());
+            }
+        }
+        match self.kind() {
+            "github" => Some("https://api.github.com".to_string()),
+            "gitlab" => Some(format!("https://{}/api/v4", self.authority())),
+            "gitea" | "forgejo" => Some(format!("https://{}/api/v1", self.authority())),
+            _ => None,
+        }
+    }
+
+    /// Does this forge support ranked search? (api_base derivable)
+    pub fn searchable(&self) -> bool {
+        self.api_base().is_some()
     }
 
     /// Clone URL for `owner/repo` on this forge.
@@ -401,5 +432,42 @@ mod tests {
         def.host = Some("sr.ht".into());
         let r = registry(&[("sh", def)]);
         assert!(r.get("sh").unwrap().clone_url("o", "r").is_err());
+    }
+
+    #[test]
+    fn api_base_derivation() {
+        let r = registry(&[]);
+        assert_eq!(
+            r.get("github").unwrap().api_base().as_deref(),
+            Some("https://api.github.com")
+        );
+        assert_eq!(
+            r.get("gitlab").unwrap().api_base().as_deref(),
+            Some("https://gitlab.com/api/v4")
+        );
+        assert_eq!(
+            r.get("codeberg").unwrap().api_base().as_deref(),
+            Some("https://codeberg.org/api/v1")
+        );
+        // searchable() follows api_base
+        assert!(r.get("github").unwrap().searchable());
+
+        // explicit override wins (trailing '/' tolerated)
+        let mut def = ForgeDef::default();
+        def.kind = Some("gitea".into());
+        def.host = Some("gitea.internal".into());
+        def.api_base = Some("http://127.0.0.1:8080/api/v1/".into());
+        let r2 = registry(&[("internal", def)]);
+        assert_eq!(
+            r2.get("internal").unwrap().api_base().as_deref(),
+            Some("http://127.0.0.1:8080/api/v1")
+        );
+
+        // cgit has no REST search API → not searchable
+        let mut def = ForgeDef::default();
+        def.kind = Some("cgit".into());
+        def.host = Some("cgit.example.com".into());
+        let r3 = registry(&[("cz", def)]);
+        assert!(!r3.get("cz").unwrap().searchable());
     }
 }

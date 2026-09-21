@@ -58,17 +58,22 @@ fn usage() -> String {
 
 usage: gitfull [options] <command> [args]
 
-commands:
-  install <spec>...    install: owner/repo | forge:owner/repo | o/r@ref | URL | /local/path
+commands (state-changing — run as root, e.g. `sudo gitfull install ...`):
+  install <spec>...    install: name (ranked forge search) | owner/repo |
+                       forge:owner/repo | o/r@ref | URL | /local/path.
+                       Missing toolchains are fetched + built automatically.
   update [name...]     re-clone and rebuild installed packages
   remove <name>...     remove installed packages (hash-verified)
-  list                 list installed packages
-  info <query>         show install record or forge resolution
-  toolchain list           catalog + installed versions
   toolchain bootstrap-gcc [--execute] [--version <v>]
-                         the single host-touching step (seed GCC; see docs/AUDIT.md)
-  toolchain build <comp> [--execute]
-                         build a component from source with the toolchain gcc
+                       manual seed-GCC build (optional override — install
+                       does this automatically when needed)
+  toolchain build <comp> [--execute] [--version <v>]
+                       manual component build (optional override)
+
+commands (read-only — no root needed):
+  list                 list installed packages
+  info <query>         install record or ranked forge resolution
+  toolchain list       catalog + installed versions
   doctor               environment checks
   config show|validate|path
   audit [N]            tail the audit log (default 20)
@@ -84,7 +89,8 @@ options:
   --version, -V        print version
   --help, -h           this help
 
-exit codes: 0 ok, 2 usage, 3 policy violation, 4 build failure, 5 not installed"
+exit codes: 0 ok, 2 usage, 3 policy/privilege violation, 4 build failure,
+            5 not installed"
     )
 }
 
@@ -185,7 +191,7 @@ fn parse_op_flags(rest: &[String], cmd: &str) -> Result<(bool, bool, bool, Vec<S
 fn exit_code(e: &GitfullError) -> ExitCode {
     match e {
         GitfullError::Usage(_) => ExitCode::from(2),
-        GitfullError::Policy { .. } => ExitCode::from(3),
+        GitfullError::Policy { .. } | GitfullError::Privilege { .. } => ExitCode::from(3),
         GitfullError::Exec { .. } | GitfullError::Sandbox(_) | GitfullError::Toolchain { .. } => {
             ExitCode::from(4)
         }
@@ -278,6 +284,8 @@ fn cmd_install(g: &Globals, rest: &[String]) -> Result<ExitCode> {
         ));
     }
     let (cfg, _) = load_config(g)?;
+    // fail fast: refuse before any search/clone/network work happens
+    gitfull::privilege::require_root(&cfg, "install")?;
     let ctx = base_ctx(&cfg, true);
     let opts = InstallOpts {
         dry_run: g.dry_run || c_dry,
@@ -293,6 +301,22 @@ fn cmd_install(g: &Globals, rest: &[String]) -> Result<ExitCode> {
                 failures += 1;
                 continue;
             }
+        };
+        // Bare names (no forge prefix, no owner/repo path) go through
+        // ranked forge search first; the resolution is printed before
+        // anything is cloned or built. Explicit refs bypass ranking.
+        let spec = match &spec.source {
+            gitfull::spec::Source::Search { .. } => {
+                match gitfull::search::resolve(&cfg, &ctx, &spec) {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        eprintln!("gitfull: {e}");
+                        failures += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => spec,
         };
         match planner::install(&cfg, &ctx, &spec, &opts) {
             Ok(Some(rec)) => {
@@ -319,6 +343,7 @@ fn cmd_install(g: &Globals, rest: &[String]) -> Result<ExitCode> {
 fn cmd_update(g: &Globals, rest: &[String]) -> Result<ExitCode> {
     let (c_yes, c_dry, c_verbose, names) = parse_op_flags(rest, "update")?;
     let (cfg, _) = load_config(g)?;
+    gitfull::privilege::require_root(&cfg, "update")?;
     let ctx = base_ctx(&cfg, true);
     let opts = InstallOpts {
         dry_run: g.dry_run || c_dry,
@@ -357,6 +382,7 @@ fn cmd_remove(g: &Globals, rest: &[String]) -> Result<ExitCode> {
         ));
     }
     let (cfg, _) = load_config(g)?;
+    gitfull::privilege::require_root(&cfg, "remove")?;
     let ctx = base_ctx(&cfg, true);
     let yes = g.yes || c_yes;
     let mut failures = 0;
@@ -484,9 +510,29 @@ fn cmd_toolchain(g: &Globals, rest: &[String]) -> Result<ExitCode> {
                         .join(", ")
                 ))
             })?;
-            let execute = rest.iter().any(|a| a == "--execute");
+            // optional per-component version pin: --version <v>
+            let mut execute = false;
+            let mut version: Option<String> = None;
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--execute" => execute = true,
+                    "--version" => {
+                        i += 1;
+                        version = rest.get(i).cloned().map(Some).ok_or_else(|| {
+                            GitfullError::Usage("--version requires a value".into())
+                        })?;
+                    }
+                    other => {
+                        return Err(GitfullError::Usage(format!(
+                            "unknown option `{other}` for toolchain build"
+                        )))
+                    }
+                }
+                i += 1;
+            }
             let ctx = base_ctx(&cfg, execute);
-            bootstrap::build_component(&cfg, &ctx, comp, execute)?;
+            bootstrap::build_component(&cfg, &ctx, comp, version.as_deref(), execute)?;
             Ok(ExitCode::SUCCESS)
         }
         other => Err(GitfullError::Usage(format!(
@@ -589,13 +635,17 @@ fn cmd_doctor(g: &Globals) -> Result<ExitCode> {
         ),
     }
 
-    // curl (tarball fetches)
+    // curl (tarball fetches + forge search queries)
     let curl_ok = util::find_in_path("curl", &cfg.host_tool_path).is_some();
     check(
         curl_ok,
-        "curl (tarball fetches)",
-        "needed only for tarball toolchain sources",
+        "curl (fetch + forge search)",
+        "tarball toolchain sources, rust channel lookup, and ranked forge \
+         search (gitfull install <name>)",
     );
+
+    // privilege model
+    println!("  privilege: {}", gitfull::privilege::mode_line(&cfg));
 
     // root writable?
     if cfg.root.exists() {
@@ -649,8 +699,9 @@ fn cmd_doctor(g: &Globals) -> Result<ExitCode> {
     let gcc_versions = mgr.installed_versions("gcc");
     if gcc_versions.is_empty() {
         println!(
-            "  [..] gcc toolchain           not bootstrapped — run `gitfull \
-             toolchain bootstrap-gcc --execute` (host compiler used once)"
+            "  [..] gcc toolchain           not bootstrapped — `sudo gitfull install <pkg>` \
+             will auto-provision it on first use (host compiler used exactly \
+             once); or run `sudo gitfull toolchain bootstrap-gcc --execute`"
         );
     } else {
         check(true, "gcc toolchain", &gcc_versions.join(", "));

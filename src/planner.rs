@@ -3,19 +3,28 @@
 //! Flow of `gitfull install <spec>`:
 //!
 //! 1. resolve the spec against the forge registry (`[repo]` overrides
-//!    can reroute the forge, pin a ref, or add requirements);
+//!    can reroute the forge, pin a ref, or add requirements) — a bare
+//!    `name` is first resolved through ranked forge search (see
+//!    [`crate::search`]);
 //! 2. create the app sandbox; clone with the **live progress UI**;
 //! 3. auto-detect the build system (no extra files needed in the repo);
 //! 4. walk package dependencies recursively (cycle-safe), cloning and
 //!    building each inside *this* sandbox under `deps/`;
-//! 5. select **shared** toolchains from `<root>/toolchains/` (missing ones
-//!    are reported with the exact bootstrap command — never installed via
-//!    a host package manager);
+//! 5. select **shared** toolchains from `<root>/toolchains/` — anything
+//!    missing is **auto-provisioned from source** by gitfull itself
+//!    ([`crate::bootstrap::ensure_components`]): the seed GCC uses the
+//!    host compiler exactly once, everything after that is built with
+//!    toolchain-managed tools. A host package manager is never invoked
+//!    (structurally impossible — see [`crate::gitproc`]);
 //! 6. build (all commands through the exec chokepoint, hermetic env);
 //! 7. stage + collect final binaries;
 //! 8. **the single sandbox-escape path** — [`install_binaries`] copies
 //!    exactly those binaries into the bin dir, hashed + audited;
 //! 9. write `meta.toml` (provenance for `list` / `update` / `remove`).
+//!
+//! Mutating operations enforce the root-privilege model
+//! ([`crate::privilege`]): they write `<root>` and the system bin dir, so
+//! they must run under `sudo` on a normal deployment.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -23,12 +32,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::bootstrap;
 use crate::config::Config;
 use crate::error::{GitfullError, Result};
 use crate::gitproc::{self, authed_url, ExecClass, ExecCtx, RemoteUrl};
 use crate::progress::ProgressUi;
 use crate::resolver::{detect_cycle, resolve_repo, ResolvedRepo};
 use crate::sandbox::Sandbox;
+use crate::search;
 use crate::sha256::sha256_file;
 use crate::spec::{PkgSpec, Source};
 use crate::toolchain::{Selection, ToolchainManager};
@@ -168,6 +179,11 @@ fn resolve_source(cfg: &Config, spec: &PkgSpec) -> Result<ResolvedSource> {
                  changes needed (see docs/CONFIG.md)"
             ))),
         },
+        Source::Search { .. } => Err(GitfullError::Unsupported(
+            "internal: a search spec reached the planner unprocessed — \
+             main.rs / info must resolve it via search::resolve first"
+                .into(),
+        )),
         Source::Local(p) => {
             let canon = fs::canonicalize(p)?;
             Ok(ResolvedSource::Local(canon))
@@ -526,6 +542,7 @@ pub fn install(
     spec: &PkgSpec,
     opts: &InstallOpts,
 ) -> Result<Option<InstallRecord>> {
+    crate::privilege::require_root(cfg, "install")?;
     cfg.ensure_root()?;
     let source = resolve_source(cfg, spec)?;
 
@@ -761,37 +778,39 @@ pub fn install(
     }
 
     if !missing.is_empty() {
-        let mut lines = Vec::new();
-        for (comp, c) in &missing {
-            if comp == "gcc" {
-                lines.push(format!(
-                    "gcc: not installed. Bootstrap the SEED GCC toolchain first:\n  \
-                     gitfull toolchain bootstrap-gcc --execute\n  \
-                     (uses the host system compiler exactly ONCE; see docs/AUDIT.md)\n  \
-                     requirement: gcc{}{}",
-                    op_text(c.op),
-                    c.version.as_deref().unwrap_or("")
-                ));
-            } else {
-                lines.push(format!(
-                    "{comp}: not installed. Build it from source with gitfull:\n  \
-                     gitfull toolchain build {comp} --execute\n  \
-                     (built with the toolchain-managed compiler — never the host one)",
-                ));
-            }
-        }
         if opts.dry_run {
-            println!("gitfull (dry-run): would need to obtain missing toolchains:");
-            for l in &lines {
-                println!("  {l}");
+            // provisioning plan only — nothing is fetched or built
+            bootstrap::ensure_components(cfg, base_ctx, &missing, true)?;
+        } else {
+            // Automatic toolchain provisioning: the seed GCC build is the
+            // single host-touching step; everything afterwards is built
+            // with toolchain-managed tools. The user never runs a manual
+            // bootstrap on the normal path.
+            bootstrap::ensure_components(cfg, base_ctx, &missing, false)?;
+            for (comp, c) in &missing {
+                match mgr.find(comp, c) {
+                    Some(sel) => {
+                        println!(
+                            "gitfull: toolchain {}-{} (shared: {})",
+                            sel.component,
+                            sel.version,
+                            sel.dir.display()
+                        );
+                        selections.insert(comp.clone(), sel);
+                    }
+                    None => {
+                        return Err(GitfullError::Toolchain {
+                            component: comp.clone(),
+                            message: format!(
+                                "auto-provisioning completed but `{comp}` still \
+                                 does not satisfy the requirement — please report \
+                                 this as a bug"
+                            ),
+                        })
+                    }
+                }
             }
-            println!("gitfull (dry-run): stopping before any build; no changes installed.");
-            return Ok(None);
         }
-        return Err(GitfullError::Toolchain {
-            component: "resolver".into(),
-            message: lines.join("\n"),
-        });
     }
 
     if opts.dry_run {
@@ -1021,6 +1040,7 @@ pub fn find_installed(cfg: &Config, query: &str) -> Result<Option<(PathBuf, Inst
 }
 
 pub fn remove(cfg: &Config, ctx: &ExecCtx, query: &str, yes: bool) -> Result<()> {
+    crate::privilege::require_root(cfg, "remove")?;
     let (meta_path, rec) = find_installed(cfg, query)?.ok_or_else(|| {
         GitfullError::NotInstalled(format!(
             "{query} (installed: {})",
@@ -1080,6 +1100,7 @@ pub fn update(
     query: &str,
     opts: &InstallOpts,
 ) -> Result<Option<InstallRecord>> {
+    crate::privilege::require_root(cfg, "update")?;
     let (_meta_path, rec) = find_installed(cfg, query)?
         .ok_or_else(|| GitfullError::NotInstalled(format!("`{query}` is not installed")))?;
     let spec = PkgSpec::parse(&rec.url)?;
@@ -1122,6 +1143,20 @@ pub fn info(cfg: &Config, query: &str) -> Result<()> {
     }
     // not installed: show forge resolution only
     let spec = PkgSpec::parse(query)?;
+    // bare names go through the same ranked forge search as install —
+    // read-only, no clone, resolution printed so the choice is visible
+    let spec = match &spec.source {
+        Source::Search { .. } => {
+            let ctx = ExecCtx {
+                audit_log: None,
+                extra_forbidden: cfg.policy.extra_forbidden_programs.clone(),
+                redactions: Vec::new(),
+                resolve_path: cfg.host_tool_path.clone(),
+            };
+            search::resolve(cfg, &ctx, &spec)?
+        }
+        _ => spec,
+    };
     match resolve_source(cfg, &spec)? {
         ResolvedSource::Git {
             forge_name,

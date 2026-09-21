@@ -32,11 +32,21 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Fixture {
+        Self::with_toolchain(label, true)
+    }
+
+    /// `seed_toolchain = false` creates the fixture WITHOUT the faked
+    /// shared gcc — used to exercise automatic toolchain provisioning
+    /// planning (dry-run only; real provisioning needs a full machine).
+    fn with_toolchain(label: &str, seed_toolchain: bool) -> Fixture {
         let root = std::env::temp_dir().join(format!("gitfull-e2e-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("root/toolchains/gcc-14.2.0/bin")).unwrap();
+        fs::create_dir_all(root.join("root")).unwrap();
         fs::create_dir_all(root.join("bin")).unwrap();
+        if seed_toolchain {
+            fs::create_dir_all(root.join("root/toolchains/gcc-14.2.0/bin")).unwrap();
+        }
 
         // ---- source fixture: a Makefile app -------------------------------
         fs::write(
@@ -66,14 +76,16 @@ int main(void) {
 
         // ---- fake shared toolchain: gcc/cc/g++ symlinks -------------------
         // (simulates an already-bootstrapped toolchains/gcc-<v>/)
-        let tcbin = root.join("root/toolchains/gcc-14.2.0/bin");
-        for prog in ["gcc", "cc", "g++"] {
-            let host = ["/usr/bin", "/bin"]
-                .iter()
-                .map(|d| PathBuf::from(d).join(prog))
-                .find(|p| p.is_file());
-            if let Some(h) = host {
-                std::os::unix::fs::symlink(&h, tcbin.join(prog)).unwrap();
+        if seed_toolchain {
+            let tcbin = root.join("root/toolchains/gcc-14.2.0/bin");
+            for prog in ["gcc", "cc", "g++"] {
+                let host = ["/usr/bin", "/bin"]
+                    .iter()
+                    .map(|d| PathBuf::from(d).join(prog))
+                    .find(|p| p.is_file());
+                if let Some(h) = host {
+                    std::os::unix::fs::symlink(&h, tcbin.join(prog)).unwrap();
+                }
             }
         }
 
@@ -270,4 +282,95 @@ fn declared_bins_are_respected() {
         .unwrap()
         .unwrap();
     assert_eq!(rec.bins[0].name, "hello-gitfull");
+}
+
+#[test]
+fn dry_run_with_missing_toolchain_plans_auto_provisioning() {
+    // The corrected happy path: a missing toolchain is no longer a hard
+    // error telling the user to bootstrap manually — install plans to
+    // auto-provision it (dry-run proves planning WITHOUT executing: no
+    // toolchain directories may appear, no network is touched).
+    if !have("gcc") || !have("cc") || !have("make") {
+        eprintln!("skipping e2e auto-provision: gcc/cc/make not present");
+        return;
+    }
+    let fx = Fixture::with_toolchain("autoprovision", false); // NO toolchains
+    let cfg = fx.cfg();
+    let ctx = fx.ctx(&cfg);
+    let opts = InstallOpts {
+        dry_run: true,
+        yes: true,
+        verbose: false,
+    };
+    let spec = PkgSpec::parse(&fx.root.join("src").display().to_string()).unwrap();
+
+    let rec = planner::install(&cfg, &ctx, &spec, &opts).unwrap();
+    assert!(rec.is_none(), "dry-run must not produce a record");
+
+    // planning only: the toolchains directory must NOT have gained the gcc
+    // component (nothing was fetched or built)
+    let tc_dir = fx.root.join("root/toolchains");
+    assert!(
+        !tc_dir.join("gcc-14.2.0").exists(),
+        "dry-run must not build anything"
+    );
+    // and nothing was installed
+    assert_eq!(fs::read_dir(fx.root.join("bin")).unwrap().flatten().count(), 0);
+}
+
+#[test]
+fn install_with_missing_toolchain_attempts_provisioning_not_manual_error() {
+    // Non-dry-run with a missing toolchain: the failure mode must come
+    // FROM the auto-provisioning attempt (network/version resolution on a
+    // full machine), never the old "run gitfull toolchain build …"
+    // manual-bootstrap error. In this offline dev environment the
+    // provisioning attempt fails at fetching — the error must mention the
+    // auto-provisioning path, not instruct a manual bootstrap.
+    if !have("gcc") || !have("cc") || !have("make") {
+        eprintln!("skipping e2e auto-provision attempt: gcc/cc/make not present");
+        return;
+    }
+    let fx = Fixture::with_toolchain("autoprovision-attempt", false);
+    // Point the gcc source at an unreachable local URL so the
+    // auto-provisioning attempt fails FAST and offline (a real machine
+    // with network would fetch the real source; here we only assert the
+    // failure mode — provisioning attempted, never a manual-bootstrap
+    // instruction).
+    fs::write(
+        fx.root.join("gitfull.conf"),
+        format!(
+            "[core]\nroot = \"{}\"\nbin_dir = \"{}\"\njobs = 2\n\n\
+             [toolchain.preferences]\ngcc = \"14.2.0\"\n\n\
+             [toolchain.sources]\ngcc = \"file:///nonexistent-gitfull-test/gcc.git\"\n",
+            fx.root.join("root").display(),
+            fx.root.join("bin").display()
+        ),
+    )
+    .unwrap();
+    let cfg = fx.cfg();
+    let ctx = fx.ctx(&cfg);
+    let opts = InstallOpts {
+        dry_run: false,
+        yes: true,
+        verbose: false,
+    };
+    let spec = PkgSpec::parse(&fx.root.join("src").display().to_string()).unwrap();
+
+    let err = match planner::install(&cfg, &ctx, &spec, &opts) {
+        Ok(_) => panic!("expected the auto-provisioning attempt to fail offline"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    // either it failed while resolving/fetching the component — or, if a
+    // reachable mirror produced a toolchain, the build itself failed; both
+    // are auto-provision outcomes. What must NEVER appear is the old
+    // manual-bootstrap instruction:
+    assert!(
+        !msg.contains("Bootstrap the SEED GCC toolchain first"),
+        "old manual-bootstrap error resurfaced: {msg}"
+    );
+    assert!(
+        !msg.contains("gitfull toolchain build") || msg.contains("auto-provisioning"),
+        "manual-build instruction outside auto-provisioning context: {msg}"
+    );
 }

@@ -14,11 +14,19 @@ in the version your distro happened to pick, onto your host filesystem.
 gitfull takes the opposite position:
 
 * the **source of truth is the Git forge** — you install `owner/repo`, from
-  any forge, at any ref;
+  any forge, at any ref; a bare `name` searches every configured forge and
+  auto-selects the best-ranked match (visible, never silent);
 * the **host system is never touched** — every app is built inside its own
   sandbox folder, with shared toolchains that gitfull builds itself;
-* the **host compiler is used exactly once** — to build the seed GCC — and
-  never again (see [docs/AUDIT.md](docs/AUDIT.md));
+* **toolchains are fetched and built automatically** — `sudo gitfull
+  install <name>` is the *only* command on the normal path; if a required
+  toolchain component is missing, gitfull provisions it from source first
+  (the host compiler is used exactly once, for the seed GCC — see
+  [docs/AUDIT.md](docs/AUDIT.md));
+* **root is required exactly where state changes** — install, update,
+  remove, and toolchain builds write `/var/lib/gitfull` and copy binaries
+  into a system bin dir, so they run as `sudo gitfull …`; `list`, `info`,
+  `doctor`, `config`, and `audit` are read-only and unprivileged;
 * **one file crosses the sandbox boundary** — the final binary, copied to
   your bin directory, hashed and audit-logged (see
   [docs/AUDIT.md](docs/AUDIT.md));
@@ -34,44 +42,93 @@ $ cargo build --release            # builds gitfull itself (a normal Rust build)
 $ sudo cp config/gitfull.conf.example /etc/gitfull.conf
 $ sudoedit /etc/gitfull.conf       # adjust root / bin_dir / forges
 
-$ gitfull doctor                   # environment readiness check
-$ gitfull toolchain bootstrap-gcc --execute
-#   ^ the ONLY step that uses the host compiler (once); everything after
-#     this uses toolchains/gcc-<v>/bin/gcc
-$ gitfull toolchain build python --execute
-$ gitfull toolchain build meson --execute
-$ gitfull toolchain build ninja --execute
+$ gitfull doctor                   # environment readiness check (no root)
 
-$ gitfull install github:mesonbuild/meson   # live progress bar, sandboxed build
-$ gitfull list
-$ gitfull info mesonbuild/meson
-$ gitfull remove mesonbuild/meson           # hash-verified removal
+$ sudo gitfull install meson       # ONE command does everything
+#   1. ranked forge search: every configured forge is queried, candidates
+#      are ranked by stars / contributors / commits / recency, and the
+#      resolution is printed BEFORE anything is cloned or built;
+#   2. missing toolchain components (gcc, python, meson, ninja, …) are
+#      fetched and built automatically — the seed GCC is the only build
+#      that ever touches the host compiler, and gitfull runs it for you;
+#   3. the app is built in its sandbox and the final binary copied out.
+
+$ gitfull list                     # read-only: no root needed
+$ gitfull info meson               # read-only: record + ranked resolution
+$ sudo gitfull remove meson        # hash-verified removal (state change)
 ```
+
+Notes on the happy path:
+
+* **No manual bootstrap step exists.** `gitfull toolchain bootstrap-gcc
+  --execute` / `gitfull toolchain build <comp> --execute` still work, but
+  they are optional manual overrides for advanced use — install
+  auto-provisions whatever is missing.
+* **State-changing commands need root** (`sudo`): `install`, `update`,
+  `remove`, and `toolchain … --execute`. Read-only commands (`list`,
+  `info`, `doctor`, `config`, `audit`) never do. Dev sandboxes that
+  override **both** `core.root` and `core.bin_dir` away from the system
+  defaults may skip sudo deliberately (see docs/AUDIT.md §2.0).
 
 Spec forms accepted everywhere a package is named:
 
 | form | meaning |
 |---|---|
-| `owner/repo` | default forge (github, unless configured) |
-| `forge:owner/repo` | explicit forge by config name (`codeberg:org/app`) |
+| `name` | **ranked search** across all configured forges; top match is
+  auto-selected and printed before anything happens (§ below) |
+| `forge:name` | ranked search scoped to that one forge |
+| `owner/repo` | default forge (github, unless configured) — no search |
+| `forge:owner/repo` | explicit forge by config name (`codeberg:org/app`) —
+  bypasses ranking entirely |
 | `owner/repo@v1.2` | pinned branch / tag / commit |
 | `https://forge.example/owner/repo.git` | full URL (matched against configured forges) |
 | `/abs/path` or `./rel/path` | local source tree (no network) |
 
+## Ranked search: bare names resolve across forges
+
+`sudo gitfull install meson` (no forge prefix, no `owner/repo`) queries the
+search API of **every configured forge** that has one (GitHub, GitLab,
+Gitea/Forgejo kinds; forges without an API are skipped with a visible
+note), then ranks candidates by **stars (40%), contributors (25%), commit
+count (25%), and recency of the last push (10%)** — log-normalized, with
+absent signals re-normalized so terser forges are not structurally
+punished. The full ranked table and the chosen `forge:owner/repo` are
+printed *before anything is cloned or built*: the auto-selection is
+always visible, never silent. Use `forge:owner/repo` to pin the exact
+repository and skip ranking. Search queries are unauthenticated read-only
+  GETs through the audited exec chokepoint — no tokens are attached.
+
 ## The 30-second tour
 
 ```console
-$ gitfull install https://gitlab.com/gnome/libfoo
-gitfull: cloning https://gitlab.com/gnome/libfoo.git
+$ sudo gitfull install meson
+gitfull: searching all configured forges for `meson` (matching repositories
+         are ranked by stars, contributors, commits, and recency; the top
+         one is auto-selected)
+gitfull: 3 candidate repository(ies) for `meson` across configured forges — ranked:
+  #    repository                               forge        stars  contribs  commits  last push
+  1    mesonbuild/meson                         github       5.9k      312      11k     3 days ago
+  2    mesonbuild/meson                         gitlab       112         -        -     3 days ago
+  3    star-lab/meson                           github        41         6       480     2 years ago
+gitfull: resolved `meson` -> github:mesonbuild/meson (auto-selected: rank 1 of 3)
+gitfull: cloning https://github.com/mesonbuild/meson.git
 Receiving  [████████████░░░░░░░░░░░░░░░░]  47%   1.8/3.9 MiB   3.4 MiB/s  ETA 00:36
-gitfull: cloned https://gitlab.com/gnome/libfoo.git (a1b2c3…)
+gitfull: cloned https://github.com/mesonbuild/meson.git (a1b2c3…)
 gitfull: detected build system: meson (auto-detected from repo files)
 gitfull: toolchain requirements: gcc, python>=3.8, meson, ninja
+gitfull: auto-provisioning 4 missing toolchain component(s) — the seed GCC
+         build uses the host compiler once; everything after uses it never
+         (detailed logs: /var/lib/gitfull/logs/)
 gitfull: toolchain gcc-14.2.0 (shared: /var/lib/gitfull/toolchains/gcc-14.2.0)
-gitfull: building gitlab-gnome-libfoo [meson]
-gitfull: installed /usr/local/bin/libfoo-tool (sha256 9b8b6602e200, 1.2 MiB)
-gitfull: install record: /var/lib/gitfull/apps/gitlab-gnome-libfoo/meta.toml
+gitfull: toolchain python-3.13 (shared: /var/lib/gitfull/toolchains/python-3.13)
+…
+gitfull: building github-mesonbuild-meson [meson]
+gitfull: installed /usr/local/bin/meson (sha256 9b8b6602e200, 1.2 MiB)
+gitfull: install record: /var/lib/gitfull/apps/github-mesonbuild-meson/meta.toml
 ```
+
+(The first install takes a while: it builds the toolchain components from
+source, once, shared with every later install.)
 
 ## Isolation model (short version)
 
@@ -93,11 +150,12 @@ gitfull: install record: /var/lib/gitfull/apps/gitlab-gnome-libfoo/meta.toml
    host cc ──(exactly once)──▶ seed GCC ──▶ all later builds
 ```
 
-* **Single host-touching path**: the seed GCC build
-  (`gitfull toolchain bootstrap-gcc --execute`) uses the host system
+* **Single host-touching path**: the seed GCC build uses the host system
   compiler exactly once, with `--disable-bootstrap` (single-stage), and
-  records its provenance. Every build after that runs through the
-  toolchain-managed compiler.
+  records its provenance — gitfull runs it **automatically** during
+  `install` when the gcc toolchain is missing. Every build after that
+  runs through the toolchain-managed compiler. (Manual override:
+  `sudo gitfull toolchain bootstrap-gcc --execute`.)
 * **Single sandbox-escape path**: `planner::install_binaries()` copies
   final binaries (mode 0755, SHA-256 recorded) to the configured bin dir.
   Nothing else writes outside `<root>`.
@@ -139,8 +197,10 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)** · annotated example:
 
 ```console
 $ cargo build --release
-$ cargo test            # 49 tests: config, forge, progress parsing, policy
-                        # enforcement, hermetic env, e2e sandboxed install
+$ cargo test            # 96 tests: config, forge, spec/search, progress
+                        # parsing, privilege model, ranked search (fake
+                        # forge API), policy enforcement, hermetic env,
+                        # e2e sandboxed install
 ```
 
 gitfull itself depends on exactly two crates — `serde` and `toml`
@@ -153,14 +213,22 @@ binary (see docs/AUDIT.md).
 ```
 gitfull [options] <command> [args]
 
-  install <spec>...          install packages
+state-changing (run as root, e.g. `sudo gitfull install ...`):
+  install <spec>...          name (ranked forge search) | owner/repo |
+                              forge:owner/repo | o/r@ref | URL | local path.
+                              Missing toolchains are fetched + built automatically.
   update [name...]           re-clone + rebuild installed packages
   remove <name>...           remove (hash-verified)
-  list                       list installed packages
-  info <query>               install record / forge resolution
-  toolchain list             catalog + installed versions
   toolchain bootstrap-gcc [--execute] [--version <v>]
-  toolchain build <comp> [--execute]
+                              manual seed-GCC build (optional override —
+                              install does this automatically when needed)
+  toolchain build <comp> [--execute] [--version <v>]
+                              manual component build (optional override)
+
+read-only (no root needed):
+  list                       list installed packages
+  info <query>               install record / ranked forge resolution
+  toolchain list             catalog + installed versions
   doctor                     environment checks
   config show|validate|path
   audit [N]                  tail the audit log
@@ -168,19 +236,21 @@ gitfull [options] <command> [args]
 options: --config <path> --root <path> --dry-run --yes/-y --no-color
          --color auto|always|never --verbose/-v --version/-V --help/-h
 
-exit codes: 0 ok · 2 usage · 3 policy violation · 4 build failure
+exit codes: 0 ok · 2 usage · 3 policy/privilege violation · 4 build failure
             · 5 not installed
 ```
 
 ## Project status
 
 v0.1.0 scaffold: the forge abstraction, config schema, sandbox manager,
-toolchain manager (seed-GCC bootstrap plan + shared versioned installs),
-dependency resolver, build-system auto-detection, clone progress UI, exec
-chokepoint + audit log, and the install/remove/list/update pipeline are
-implemented and tested (49 tests). The seed-GCC *execution* path targets a
-full Linux machine and is intentionally not exercised in restricted
-development environments — its plan, version resolution, and exec
-classification are tested.
+toolchain manager (seed-GCC bootstrap plan + shared versioned installs,
+**auto-provisioned during install**), dependency resolver, build-system
+auto-detection, **ranked multi-forge search for bare package names**,
+**root-privilege enforcement for all state-changing operations**, clone
+progress UI, exec chokepoint + audit log, and the install/remove/list/
+update pipeline are implemented and tested (96 tests). The seed-GCC
+*execution* path targets a full Linux machine and is intentionally not
+exercised in restricted development environments — its plan, version
+resolution, and exec classification are tested.
 
 License: **proprietary** — all rights reserved (see `LICENSE`).

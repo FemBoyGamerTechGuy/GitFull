@@ -21,6 +21,7 @@
 //! |----------------------|--------------------------------------------|---------|
 //! | `SeedHostCompiler`   | the ONE sanctioned host-compiler use       | cc for seed GCC |
 //! | `FetchTool`          | source fetchers, sealed env, cache-only writes | git, curl |
+//! | `ForgeApi`           | read-only forge REST queries (search/rank) | curl GET |
 //! | `HostUtility`        | POSIX utilities on sandbox paths           | sh, tar |
 //! | `Toolchain`          | toolchain-managed compilers/build tools    | gcc, meson, ninja |
 
@@ -89,6 +90,10 @@ pub enum ExecClass {
     /// Source fetchers (`git`, `curl`): sealed environment, write only
     /// inside the cache.
     FetchTool,
+    /// Read-only forge REST API queries (`curl -i GET`) used by the
+    /// search/ranking resolver. Network reads only, **no tokens are ever
+    /// attached**, no writes anywhere.
+    ForgeApi,
     /// POSIX utilities (`sh`, `tar`, ...) operating on sandbox paths.
     HostUtility,
     /// Toolchain-managed compilers and build tools (everything after the
@@ -101,6 +106,7 @@ impl ExecClass {
         match self {
             ExecClass::SeedHostCompiler => "seed-host-compiler",
             ExecClass::FetchTool => "fetch-tool",
+            ExecClass::ForgeApi => "forge-api",
             ExecClass::HostUtility => "host-utility",
             ExecClass::Toolchain => "toolchain",
         }
@@ -546,4 +552,172 @@ pub fn curl_download(ctx: &ExecCtx, url: &str, dest: &Path, host_tool_path: &str
     ];
     run(ctx, &argv, ExecClass::FetchTool, Path::new("."), &env, None)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Forge REST queries (search / ranking)
+// ---------------------------------------------------------------------------
+
+/// One `curl -i GET` response, split into status line, headers, and body.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u32,
+    /// Header names lowercased (`link`, `x-ratelimit-remaining`, ...).
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl HttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// Read-only HTTP GET via `curl -i`, classified as `ForgeApi`.
+///
+/// * never attaches any authentication (public endpoints only);
+/// * response headers are kept so paginated counts can be read from the
+///   `Link` header (`rel="last"`);
+/// * every call is audit-logged with its URL — the URL is the only input
+///   and contains no secrets.
+pub fn http_get(
+    ctx: &ExecCtx,
+    url: &str,
+    host_tool_path: &str,
+    accept: Option<&str>,
+    max_time_secs: u64,
+) -> Result<HttpResponse> {
+    let mut argv = vec![
+        "curl".to_string(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--include".into(),
+        "--max-time".to_string(),
+        max_time_secs.to_string(),
+        "-A".into(),
+        format!("gitfull/{}", crate::VERSION),
+    ];
+    if let Some(acc) = accept {
+        argv.push("-H".into());
+        argv.push(format!("Accept: {acc}"));
+    }
+    argv.push(url.to_string());
+    let env: Vec<(String, String)> = vec![
+        ("PATH".into(), host_tool_path.to_string()),
+        ("LC_ALL".into(), "C".into()),
+    ];
+    let out = run(ctx, &argv, ExecClass::ForgeApi, Path::new("."), &env, None)?;
+    Ok(parse_http_include(&out))
+}
+
+/// Fetch a plain-text/TOML resource as a String (FetchTool — same class as
+/// other toolchain source fetches; used for the rust dist channel file).
+pub fn curl_text(ctx: &ExecCtx, url: &str, host_tool_path: &str) -> Result<String> {
+    let argv = vec![
+        "curl".to_string(),
+        "--fail".into(),
+        "--location".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--max-time".into(),
+        "60".into(),
+        "-A".into(),
+        format!("gitfull/{}", crate::VERSION),
+        url.to_string(),
+    ];
+    let env: Vec<(String, String)> = vec![
+        ("PATH".into(), host_tool_path.to_string()),
+        ("LC_ALL".into(), "C".into()),
+    ];
+    run(ctx, &argv, ExecClass::FetchTool, Path::new("."), &env, None)
+}
+
+/// Split `curl -i` output (ONE header block + body — http_get never passes
+/// `--location`, so redirects are returned as-is, not followed) into
+/// status, headers, and body. A body that itself starts with `HTTP/` is
+/// therefore left verbatim in the body.
+fn parse_http_include(raw: &str) -> HttpResponse {
+    let mut status = 0u32;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body = raw;
+    if raw.starts_with("HTTP/") {
+        let (block_end, sep_len) = match raw.find("\r\n\r\n") {
+            Some(i) => (i, 4),
+            None => match raw.find("\n\n") {
+                Some(i) => (i, 2),
+                None => (raw.len(), 0), // malformed: treat everything as headers
+            },
+        };
+        let block = &raw[..block_end];
+        for (i, line) in block.lines().enumerate() {
+            if i == 0 {
+                // "HTTP/1.1 200 OK"
+                if let Some(code) = line.split_whitespace().nth(1) {
+                    status = code.parse().unwrap_or(0);
+                }
+            } else if let Some((k, v)) = line.split_once(':') {
+                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        body = &raw[block_end + sep_len..];
+    }
+    HttpResponse {
+        status,
+        headers,
+        body: body.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_block() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <https://x?page=2>; rel=\"last\"\r\n\r\n{\"a\":1}";
+        let r = parse_http_include(raw);
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("content-type"), Some("application/json"));
+        assert!(r.header("link").unwrap().contains("page=2"));
+        assert_eq!(r.body, "{\"a\":1}");
+        assert!(r.ok());
+    }
+
+    #[test]
+    fn redirects_are_returned_not_followed() {
+        // http_get never passes --location: a 302 surfaces as status 302
+        // and everything after the first header block stays body verbatim
+        let raw = "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\n\r\nHTTP/2 200\r\nX-Thing: y\r\n\r\nbody-text";
+        let r = parse_http_include(raw);
+        assert_eq!(r.status, 302);
+        assert_eq!(r.header("location"), Some("/elsewhere"));
+        assert!(r.body.starts_with("HTTP/2 200"));
+        assert!(r.body.ends_with("body-text"));
+        assert!(!r.ok());
+    }
+
+    #[test]
+    fn handles_missing_body_and_lf_only() {
+        let r = parse_http_include("HTTP/1.1 404 Not Found\nServer: x\n\n");
+        assert_eq!(r.status, 404);
+        assert!(!r.ok());
+        assert_eq!(r.body, "");
+    }
+
+    #[test]
+    fn body_with_header_like_content_is_not_split() {
+        let raw = "HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 not really\r\n\r\ninner";
+        let r = parse_http_include(raw);
+        // only the FIRST block is headers; the rest stays body verbatim
+        assert_eq!(r.status, 200);
+        assert!(r.body.starts_with("HTTP/1.1 not really"));
+    }
 }

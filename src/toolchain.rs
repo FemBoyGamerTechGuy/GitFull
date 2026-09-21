@@ -46,6 +46,7 @@ use crate::resolver::Constraint;
 use crate::util::version_cmp;
 
 /// One toolchain component in the catalog.
+#[derive(Debug)]
 pub struct ComponentSpec {
     pub name: &'static str,
     /// Default source (git URL unless noted). `{version}` is substituted
@@ -186,12 +187,14 @@ impl ToolchainManager {
 
     /// Resolve the seed GCC version: explicit pin (`seed_gcc_version`, or
     /// `preferences.gcc`), otherwise **latest** via git tag query. There is
-    /// deliberately no hardcoded default.
+    /// deliberately no hardcoded default. `constraint` filters acceptable
+    /// versions when auto-detecting (e.g. `gcc>=13`).
     pub fn resolve_seed_gcc_version(
         &self,
         ctx: &ExecCtx,
         host_tool_path: &str,
         git_home: &Path,
+        constraint: &Constraint,
     ) -> Result<String> {
         if let Some(v) = &self.cfg.seed_gcc_version {
             return Ok(v.clone());
@@ -219,15 +222,17 @@ impl ToolchainManager {
                     && v.split('.').count() == 3
                     && v.split('.')
                         .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                    && constraint.satisfies(v)
             })
             .collect();
         versions.sort_by(|a, b| version_cmp(a, b));
         versions.pop().ok_or_else(|| GitfullError::Toolchain {
             component: "gcc".into(),
             message: format!(
-                "could not auto-detect the latest GCC release from {source} \
-                     (no `refs/tags/releases/gcc-X.Y.Z` tags matched). Pin one \
-                     explicitly with toolchain.seed_gcc_version in gitfull.conf"
+                "could not auto-detect a GCC release satisfying `{}` from \
+                 {source} (no `refs/tags/releases/gcc-X.Y.Z` tags matched). Pin \
+                 one explicitly with toolchain.seed_gcc_version in gitfull.conf",
+                constraint_text(constraint)
             ),
         })
     }
@@ -286,6 +291,106 @@ impl ToolchainManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Version auto-resolution for non-seed components
+// ---------------------------------------------------------------------------
+
+fn constraint_text(c: &Constraint) -> String {
+    use crate::resolver::CmpOp::*;
+    match c.op {
+        Any => "any".to_string(),
+        _ => format!("{}{}", op_char(c.op), c.version.as_deref().unwrap_or("")),
+    }
+}
+
+fn op_char(op: crate::resolver::CmpOp) -> &'static str {
+    use crate::resolver::CmpOp::*;
+    match op {
+        Any => "",
+        Eq => "=",
+        Gt => ">",
+        Gte => ">=",
+        Lt => "<",
+        Lte => "<=",
+    }
+}
+
+/// Turn one `refs/tags/...` string into a version number, accepting the
+/// common conventions: `X.Y.Z`, `vX.Y.Z`, and gcc-style
+/// `releases/gcc-X.Y.Z`. Pre-releases (`-rc1`, `b2`, ...) and
+/// single-component tags are rejected so `max` picks a stable release.
+pub fn tag_version(ref_str: &str) -> Option<String> {
+    let t = ref_str.strip_prefix("refs/tags/")?;
+    let t = match t.strip_prefix("releases/gcc-") {
+        Some(v) => v,
+        None => t.strip_prefix('v').unwrap_or(t),
+    };
+    let ok = !t.is_empty()
+        && !t.contains('-')
+        && t.split('.').count() >= 2
+        && t.split('.').all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+    if ok {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Newest stable release tag (as a version string) satisfying
+/// `constraint`. Pure — testable against fixture ref lists.
+pub fn pick_latest_tag(refs: &[String], constraint: &Constraint) -> Option<String> {
+    refs.iter()
+        .filter_map(|r| tag_version(r))
+        .filter(|v| constraint.satisfies(v))
+        .max_by(|a, b| version_cmp(a, b))
+}
+
+/// Query a component's git source tags and resolve the newest stable
+/// release satisfying `constraint` (sealed FetchTool — no forge API, no
+/// hardcoded versions).
+pub fn resolve_latest_git_version(
+    ctx: &ExecCtx,
+    source: &str,
+    constraint: &Constraint,
+    host_tool_path: &str,
+    git_home: &Path,
+) -> Result<String> {
+    let refs = gitproc::git_ls_remote_tags(ctx, source, "*", host_tool_path, git_home)?;
+    pick_latest_tag(&refs, constraint).ok_or_else(|| GitfullError::Toolchain {
+        component: "version-resolver".into(),
+        message: format!(
+            "no stable release tag satisfying `{}` found at {source} \
+             (looked for vX.Y.Z / X.Y.Z style tags). Pin a version with \
+             [toolchain.preferences] in gitfull.conf",
+            constraint_text(constraint)
+        ),
+    })
+}
+
+/// Current stable rust version, read from the official dist channel file
+/// (TOML — parsed with the same `toml` crate as the config). No hardcoded
+/// version, no JSON, no API surface beyond the static dist server.
+pub fn resolve_latest_rust_version(
+    ctx: &ExecCtx,
+    host_tool_path: &str,
+) -> Result<String> {
+    let text =
+        gitproc::curl_text(ctx, "https://static.rust-lang.org/dist/channel-rust-stable.toml", host_tool_path)?;
+    let v: toml::Value = toml::from_str(&text).map_err(|e| GitfullError::Toolchain {
+        component: "rust".into(),
+        message: format!("channel-rust-stable.toml did not parse: {e}"),
+    })?;
+    v.get("pkg")
+        .and_then(|p| p.get("rust"))
+        .and_then(|r| r.get("version"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| GitfullError::Toolchain {
+            component: "rust".into(),
+            message: "channel-rust-stable.toml has no pkg.rust.version".into(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +441,44 @@ mod tests {
         assert!(mgr.find("python", &any).is_some());
         assert!(mgr.find("cmake", &any).is_none());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tag_version_conventions() {
+        // vX.Y.Z / X.Y.Z / gcc release tags
+        assert_eq!(tag_version("refs/tags/v3.12.4").as_deref(), Some("3.12.4"));
+        assert_eq!(tag_version("refs/tags/1.4.2").as_deref(), Some("1.4.2"));
+        assert_eq!(
+            tag_version("refs/tags/releases/gcc-14.2.0").as_deref(),
+            Some("14.2.0")
+        );
+        assert_eq!(tag_version("refs/tags/0.56.17").as_deref(), Some("0.56.17"));
+        // pre-releases, single components, non-numeric: rejected
+        assert_eq!(tag_version("refs/tags/v3.13.0b1"), None);
+        assert_eq!(tag_version("refs/tags/v3.30.0-rc4"), None);
+        assert_eq!(tag_version("refs/tags/latest"), None);
+        assert_eq!(tag_version("refs/tags/14"), None);
+        assert_eq!(tag_version("refs/heads/main"), None);
+        assert_eq!(tag_version("not-a-ref"), None);
+    }
+
+    #[test]
+    fn pick_latest_respects_constraints() {
+        let refs: Vec<String> = [
+            "refs/tags/v3.10.0",
+            "refs/tags/v3.11.5",
+            "refs/tags/v3.12.4",
+            "refs/tags/v3.13.0b1", // pre-release: excluded
+            "refs/tags/other",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let any = Constraint::parse_any();
+        assert_eq!(pick_latest_tag(&refs, &any).as_deref(), Some("3.12.4"));
+        let lt = Constraint::parse_op(crate::resolver::CmpOp::Lt, "3.12".into());
+        assert_eq!(pick_latest_tag(&refs, &lt).as_deref(), Some("3.11.5"));
+        let gt = Constraint::parse_op(crate::resolver::CmpOp::Gte, "3.13".into());
+        assert_eq!(pick_latest_tag(&refs, &gt), None);
     }
 }

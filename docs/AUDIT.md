@@ -22,10 +22,10 @@ toolchain components (python, meson, ninja, cmake, vala, rust).
 | concern | location |
 |---|---|
 | plan generation | `src/toolchain.rs` → `ToolchainManager::seed_gcc_plan()` |
-| execution | `src/bootstrap.rs` → `bootstrap_seed_gcc()` |
+| execution | `src/bootstrap.rs` → `bootstrap_seed_gcc()` / `seed_gcc_resolved()` |
 | exec classification | `src/gitproc.rs` → `ExecClass::SeedHostCompiler` |
 | provenance record | `toolchains/gcc-<v>/meta.toml` (`built_by = "host-cc (seed)"`) |
-| user command | `gitfull toolchain bootstrap-gcc --execute` |
+| trigger | **automatic**: `gitfull install` provisions the seed itself when missing (`bootstrap::ensure_components`); manual override `sudo gitfull toolchain bootstrap-gcc --execute` |
 
 **Sequence (exactly what `--execute` runs):**
 
@@ -63,8 +63,10 @@ toolchain components (python, meson, ninja, cmake, vala, rust).
 
 **What this path does NOT do:** it does not write anywhere outside
 `<root>` (source in `cache/`, build in `toolchains/.build/`, install in
-`toolchains/gcc-<v>/`); it does not invoke any package manager; it does
-not require root.
+`toolchains/gcc-<v>/`); it does not invoke any package manager. It is a
+state-changing operation, so on a normal deployment it runs as root like
+all other mutating operations (§2.1) — root is required by the *target
+paths*, not by the host-compiler use itself.
 
 ### 1.2 The single sandbox-escape path: the final binary copy
 
@@ -107,11 +109,38 @@ gitfull spawns subprocesses in exactly one place:
 `src/gitproc.rs` (`run`, `run_stream_stderr`). Every spawn is
 deny-list-checked, given a fully-specified environment, and audited.
 
+### 2.0 The privilege model (who may run what)
+
+Mutating operations — `install`, `update`, `remove`, and toolchain builds
+with `--execute` — write `<root>` (default `/var/lib/gitfull`) and copy
+binaries into a system-wide bin dir (default `/usr/local/bin`). Neither
+is possible as a normal user, so **gitfull requires root for all
+state-changing operations**: `sudo gitfull install …`, `sudo gitfull
+remove …`, etc. The check (`src/privilege.rs`) runs at both the CLI
+(fail-fast, before any network work) and the library entry points
+(`planner::install/update/remove`, `bootstrap::ensure_components` /
+`bootstrap_seed_gcc` / `build_component`), so it cannot be bypassed by
+calling the API directly. Exit code 3, with the exact `sudo gitfull …`
+line to re-run.
+
+Read-only commands — `list`, `info`, `doctor`, `config`, `audit` — never
+require root: they create nothing and only read state that already exists
+(filesystem permissions remain the final arbiter of visibility).
+
+One explicit carve-out: when **both** `core.root` **and** `core.bin_dir`
+are overridden away from the system defaults, gitfull is deliberately
+operating on user-writable paths (dev sandboxes, the test suite) and
+mutating commands are allowed without root. Keeping either system path
+keeps the requirement.
+
+### 2.1 Program inventory
+
 | program | class | when | writes confined to | notes |
 |---|---|---|---|---|
 | `cc`/`gcc`/`g++` (host) | `SeedHostCompiler` | seed GCC build window only | `<root>` | §1.1 |
 | `git` | `FetchTool` | clones, `ls-remote` (version auto-detect), `rev-parse` | clone destination (sandbox or cache) | sealed env: `GIT_CONFIG_NOSYSTEM=1`, empty `GIT_CONFIG_GLOBAL`, redirected `HOME`, `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=true`, credential helpers disabled via `-c credential.helper=`; optional token embedded in the clone URL and **redacted from every log** |
-| `curl` | `FetchTool` | tarball toolchain sources (rust) | `--output` target in `<root>/cache` | `--fail --location --silent --show-error` |
+| `curl` | `FetchTool` | tarball toolchain sources (rust), the rust stable-channel TOML | `--output` target in `<root>/cache` (or stdout) | `--fail --location --silent --show-error` |
+| `curl` | `ForgeApi` | **read-only forge search/ranking queries** (`gitfull install <name>`, `info <name>`) | **nothing — network reads only** | `--include` GET, unauthenticated, no tokens ever attached; responses parsed by the hand-written JSON parser (`src/json.rs`), so no new crates |
 | `sh` | `FetchTool` | `contrib/download_prerequisites` (GCC GMP/MPFR/MPC) | inside the GCC source tree | network fetch only |
 | `tar` | `HostUtility` | unpacking toolchain tarballs | `<root>/toolchains` | `-xJf` |
 | `make`, `ninja`, `meson`, `cmake`, `cargo`, `configure` scripts | `Toolchain` | builds | the build's sandbox | resolved via the sandbox `PATH` (toolchain bins first); env is fully hermetic (§3) |
@@ -127,11 +156,18 @@ PATH the caller specified for that child).
 
 1. `git clone` / `git ls-remote` → the forge host of the package being
    installed, and the GCC/toolchain source hosts (all configurable);
-2. `curl` → toolchain tarball hosts (default:
-   `static.rust-lang.org`, configurable);
-3. `contrib/download_prerequisites` → GNU mirror hosts (GCC prerequisite
+2. `curl` (`ForgeApi`, read-only GETs) → the REST search endpoints of the
+   **configured forges** (GitHub `/search/repositories`, GitLab
+   `/projects`, Gitea/Forgejo `/repos/search`; base URLs derived from the
+   forge kind or set explicitly via `api_base`, and the top GitHub
+   candidates' `/contributors` and `/commits` pages for ranking data).
+   No authentication is ever attached — public endpoints only;
+3. `curl` (`FetchTool`) → toolchain tarball hosts (default:
+   `static.rust-lang.org`, configurable) and the rust stable-channel
+   manifest;
+4. `contrib/download_prerequisites` → GNU mirror hosts (GCC prerequisite
    tarballs), only during seed bootstrap;
-4. inside target-app builds, the app's own build system may fetch its
+5. inside target-app builds, the app's own build system may fetch its
    own dependencies (e.g. `cargo` fetching crates). That happens inside
    the sandbox, is the target app's behavior, not gitfull's, and never
    lands outside the sandbox. gitfull itself never consumes those
@@ -211,9 +247,14 @@ bypass because there is no other spawn path in the codebase.
 
 All dependency resolution is therefore performed internally by gitfull:
 toolchain needs are computed from the detected build system + config
-constraints and satisfied from `<root>/toolchains/`; package needs are
-other forge repos cloned and built inside the requesting app's sandbox
-(`src/resolver.rs`, `src/planner.rs`).
+constraints and satisfied from `<root>/toolchains/` — and when a needed
+component is missing, `gitfull install` **auto-provisions it from
+source** (`bootstrap::ensure_components`): the seed GCC first (the single
+host touch, §1.1), then each remaining component built with
+already-managed tools. The user never runs a manual bootstrap step on
+the normal path; `gitfull toolchain …` subcommands remain as optional
+overrides. Package needs are other forge repos cloned and built inside
+the requesting app's sandbox (`src/resolver.rs`, `src/planner.rs`).
 
 ---
 
@@ -249,7 +290,8 @@ orchestrator, so target license terms do not attach to it
 `<root>/audit.log` is append-only and records:
 
 * every process spawn: `<epoch>\texec\t<class>\t<program>\t<args
-  (redacted)>\t<cwd>\t<status>`
+  (redacted)>\t<cwd>\t<status>` — classes are `seed-host-compiler`,
+  `fetch-tool`, `forge-api`, `host-utility`, `toolchain`
 * every sandbox-escape: `<epoch>\tinstall-binary\t<name>\t<sha256>\t<dest>`
 * every removal: `<epoch>\tremove-binary\t<name>\t<sha256>\t<dest>`
 

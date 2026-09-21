@@ -6,29 +6,36 @@
 src/
 ├── main.rs        CLI: verb commands, arg parsing, doctor, exit codes
 ├── lib.rs         crate root + the isolation-model doc comment
-├── error.rs       GitfullError (Policy violations are loud and typed)
+├── error.rs       GitfullError (Policy/Privilege violations are loud and typed)
 ├── config.rs      /etc/gitfull.conf schema (serde), defaults, validation
 ├── forge.rs       forge registry: data-driven forges, URL rendering,
-│                  URL→forge reverse matching, clone templates
+│                  URL→forge reverse matching, clone templates,
+│                  search-API bases
 ├── spec.rs        package spec parsing (owner/repo, forge:o/r, @ref,
-│                  URLs, local paths)
+│                  URLs, local paths, bare names → Search specs)
 ├── gitproc.rs     THE exec chokepoint: forbidden-program denylist,
 │                  hermetic child envs, audit log, sealed git ops
 │                  (clone w/ progress streaming, ls-remote, rev-parse),
-│                  curl download
+│                  curl download, curl forge-API GETs
 ├── progress.rs    git progress-line parsing + live bar/ETA/MB renderer
 ├── sandbox.rs     per-app sandbox layout + build environment assembly
+├── privilege.rs   root-privilege model: euid check, per-command gating
+├── search.rs      ranked forge search: candidate fetch, enrichment,
+│                  scoring, visible resolution (bare-name installs)
+├── json.rs        hand-written JSON parser (search responses; no crates)
 ├── toolchain.rs   shared versioned toolchains: catalog, scanning,
 │                  constraint-aware selection, seed-GCC plan,
 │                  latest-tag auto-detection
-├── bootstrap.rs   seed-GCC execution (the single host touch) and
-│                  from-source component builds
+├── bootstrap.rs   seed-GCC execution (the single host touch), from-source
+│                  component builds, and automatic provisioning
+│                  (ensure_components — used by install)
 ├── manifest.rs    build-system auto-detection (+ optional gitfull.toml)
 ├── resolver.rs    version constraints, implicit toolchain needs,
 │                  per-repo requirement merging, cycle detection
-├── planner.rs     install pipeline: resolve → clone → detect → dep walk
-│                  → toolchain select → build → stage → collect →
-│                  install_binaries (the single sandbox escape) → meta
+├── planner.rs     install pipeline: resolve (search?) → clone → detect →
+│                  dep walk → toolchain select (+ auto-provision) →
+│                  build → stage → collect → install_binaries (the
+│                  single sandbox escape) → meta
 └── sha256.rs      dependency-free SHA-256 (provenance hashes)
 ```
 
@@ -36,6 +43,13 @@ src/
 
 ```
  spec ─▶ resolve_source ─▶ sandbox create ─▶ clone (progress UI)
+   │            ▲
+   │            └─ bare `name` spec? ─▶ search::resolve first:
+   │               query every configured forge's search API, rank by
+   │               stars/contributors/commits/recency, PRINT the ranked
+   │               table + chosen forge:owner/repo, then continue with
+   │               that concrete spec (explicit specs skip this)
+   │
                                      │
                         ┌────────────┴─────────────┐
                         ▼                          ▼
@@ -45,7 +59,9 @@ src/
                         └────────────┬─────────────┘
                                      ▼
                         toolchain selection (shared, constraint-aware)
-                        │ missing gcc → "run bootstrap-gcc" (never a PM)
+                        │ missing components → bootstrap::ensure_components
+                        │   (AUTO-provision from source — seed GCC included;
+                        │    never a package manager, never a manual step)
                         ▼
               build deps (Toolchain class, hermetic env)
                         ▼
@@ -58,7 +74,66 @@ src/
 ```
 
 `--dry-run` runs everything read-only up to and including the plan
-printout, then stops before any build.
+printout (search resolution still happens and is printed; missing
+toolchains are *planned*, not provisioned), then stops before any build.
+
+## Privilege model (privilege.rs)
+
+gitfull writes `<root>` (default `/var/lib/gitfull`) and copies final
+binaries into a system-wide bin dir (default `/usr/local/bin`) — both
+root-owned on a normal Linux install. **Every state-changing operation —
+`install`, `update`, `remove`, toolchain builds with `--execute`, and the
+auto-provisioning that install triggers — therefore requires root**
+(`sudo gitfull …`). The check is enforced twice: fail-fast in the CLI
+(before any search/clone/network work) and inside the library entry
+points (`planner::install/update/remove`,
+`bootstrap::ensure_components`/`bootstrap_seed_gcc`/`build_component`),
+so the API cannot bypass it. euid is read from `/proc/self/status` — no
+libc dependency. Refusal exits with code 3 and prints the exact
+`sudo gitfull …` line to re-run.
+
+Read-only commands (`list`, `info`, `doctor`, `config`, `audit`) have no
+gate: they create nothing and only read existing state.
+
+**Dev/test carve-out (explicit, not silent):** when *both* `core.root`
+and `core.bin_dir` are overridden away from the system defaults, gitfull
+is deliberately operating on user-writable paths (throwaway sandboxes,
+the test suite) and mutating commands are allowed without root. Keeping
+either system path keeps the requirement — writing `/var/lib/gitfull`
+OR copying into `/usr/local/bin` each need root on their own.
+
+## Ranked forge search (search.rs + json.rs)
+
+A bare `name` (no forge prefix, no `owner/repo` path) is parsed as a
+`Source::Search` spec and resolved before anything is cloned:
+
+1. **Query** — every configured forge with a search API is asked for up
+   to 5 candidates (GitHub `/search/repositories?q=…+in:name`, GitLab
+   `/projects?search=…`, Gitea/Forgejo `/repos/search?q=…`; forges
+   without an `api_base` are skipped with a visible note). HTTP is
+   `curl` under the `ForgeApi` exec class at the chokepoint:
+   unauthenticated read-only GETs, no tokens ever attached, 20 s
+   timeout, fully audit-logged. Responses are parsed by the
+   hand-written JSON parser (`src/json.rs`) — the crate budget stays
+   exactly `serde` + `toml`.
+2. **Enrich** — for the top GitHub candidates only (≤3, to respect
+   unauthenticated rate limits), contributor and commit counts are read
+   from `Link`-header pagination (`?per_page=1` → `rel="last"` page
+   number). Rate limits degrade softly: the candidate keeps `None` and
+   is scored on its other signals.
+3. **Rank** — each signal is log-normalized and weighted: stars 0.40
+   (`log10(1+n)/6`), contributors 0.25 (`log10(1+n)/4`), commits 0.25
+   (`log10(1+n)/6`), recency 0.10 (`2^(−days/365)`). Absent signals have
+   their weights re-normalized across present ones, so a GitLab repo is
+   not structurally punished for its forge's terser API. Ordering is
+   deterministic: score desc, stars desc, full name asc.
+4. **Resolve visibly** — the full ranked table and the chosen
+   `forge:owner/repo` are printed **before anything is cloned or
+   built**: auto-selection is visible, never silent. The explicit
+   `forge:owner/repo` form bypasses ranking entirely.
+
+`forge:name` scopes the same flow to one forge. `gitfull info <name>`
+reuses the same resolution read-only.
 
 ## Filesystem layout
 
@@ -124,6 +199,9 @@ never required.
 * **Toolchain needs** are implied by the detected build system (meson →
   gcc + python≥3.8 + meson + ninja; cargo → rust; …) and merged with
   `[repo] toolchains = ["gcc>=13", …]` constraints (tighter bound wins).
+* **Bare names** (`install meson`) are `Source::Search` specs — resolved
+  through ranked forge search (see above) *before* the pipeline runs;
+  `owner/repo` and `forge:owner/repo` specs never trigger a search.
 * **Package needs** are `[repo] packages = ["owner/repo", …]` — other
   forge repos. The planner walks them breadth-first with a visited set
   and cycle detection (`a -> b -> a` is a hard error), cloning each into
@@ -152,6 +230,20 @@ Seed-GCC version resolution order: `--version` flag →
 `toolchain.seed_gcc_version` → `toolchain.preferences.gcc` → **latest**
 release tag auto-detected via `git ls-remote` (no hardcoded default).
 
+### Automatic provisioning (bootstrap::ensure_components)
+
+The normal path never runs a manual bootstrap: during `install`, after
+toolchain selection, every *missing* component is provisioned
+automatically — cloned/fetched, built from source, and installed into
+`toolchains/<comp>-<version>/` — before the app build starts. Ordering
+respects build dependencies (seed GCC → python → meson/ninja/cmake/
+vala…), the seed GCC uses the host compiler exactly once, and every
+later component is built with already-provisioned toolchain tools.
+`--dry-run` prints the provisioning plan instead. The `gitfull
+toolchain build|bootstrap-gcc` subcommands remain as optional manual /
+advanced overrides (version pinning, pre-warming) and share the same
+code path.
+
 ## Exec classes (gitproc.rs)
 
 Every spawn is classified, enforced, and audited:
@@ -160,6 +252,7 @@ Every spawn is classified, enforced, and audited:
 |---|---|---|
 | `SeedHostCompiler` | the seed-GCC build window only | the ONE host-compiler use |
 | `FetchTool` | git, curl, download_prerequisites | sealed env, writes confined to cache/sandbox |
+| `ForgeApi` | curl: read-only forge search/ranking GETs | unauthenticated, no tokens, writes nothing |
 | `HostUtility` | POSIX utilities on sandbox paths | sandbox-path operands only |
 | `Toolchain` | all post-seed builds | toolchain-managed compilers, hermetic env |
 
@@ -169,13 +262,22 @@ fully-specified child env, audit-log append with secret redaction.
 ## Testing strategy
 
 * unit: TOML/schema, forge URLs + templates + reverse matching, spec
-  parsing, progress-line parsing + rendering, constraint math, denylist,
-  SHA-256 vectors, version comparison, catalog/scanning;
+  parsing (incl. bare-name → Search specs), progress-line parsing +
+  rendering, constraint math, denylist, SHA-256 vectors, version
+  comparison, catalog/scanning, JSON parser vectors, search-response
+  parsing + Link-header pagination + RFC 3339 dates + scoring
+  determinism, privilege decision core;
 * integration: example-config parse, dependency-posture enforcement
   (exactly serde+toml, publish=false, proprietary LICENSE);
-* e2e (no network): local-path fixture + faked shared toolchain → full
-  pipeline → binary crosses the sandbox escape → runs → hash-verified
-  remove; reinstall wipe; dry-run; declared-bins;
+* e2e (no external network): local-path fixture + faked shared
+  toolchain → full pipeline → binary crosses the sandbox escape → runs
+  → hash-verified remove; reinstall wipe; dry-run; declared-bins;
+  ranked search against a local fake forge API (std-only HTTP server:
+  all three forge kinds queried, enrichment via Link headers,
+  resolution printed, `forge:name` scoping, no-match errors);
+* privilege: root required for install/update/remove on system paths,
+  both-paths-overridden dev mode allowed, read-only commands ungated;
 * NOT tested here by design: the seed-GCC *execution* and component
-  builds (they need a full Linux machine); their plan generation,
-  version resolution, and classification are tested.
+  builds (they need a full Linux machine) and live forge APIs; their
+  plan generation, version resolution, classification, URL building,
+  and response parsing are tested.

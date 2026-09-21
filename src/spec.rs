@@ -4,13 +4,20 @@
 //!
 //! * `owner/repo` — default forge
 //! * `forge:owner/repo` — explicit forge by config name
+//! * `name` — **search form**: rank matching repos across all configured
+//!   forges and auto-select the top result (see [`crate::search`]); the
+//!   resolution is always printed before anything is built
+//! * `forge:name` — search form scoped to one forge
 //! * `owner/repo@ref` — pinned branch/tag/commit (combine: `forge:o/r@v1`)
 //! * `https://forge.example/owner/repo.git` — full clone URL (matched
 //!   against configured forge hosts)
 //! * `/abs/path` or `./rel/path` — local source tree (no forge, no clone)
 //!
-//! Owners may contain `/` (GitLab-style subgroups). The final path segment
-//! is always the repo name.
+//! A single-token name without `/` is a search term, not an error: an
+//! explicit `forge:owner/repo` reference bypasses ranking entirely, while
+//! a bare name goes through forge search + ranking first. Owners may
+//! contain `/` (GitLab-style subgroups); the final path segment is always
+//! the repo name.
 
 use std::path::PathBuf;
 
@@ -23,6 +30,13 @@ pub enum Source {
         forge: Option<String>,
         owner: String,
         repo: String,
+    },
+    /// A search term: bare `name` (search all configured forges) or
+    /// `forge:name` (search one forge). Resolved by [`crate::search`] into
+    /// a concrete `Forge` spec before install; never reaches the planner.
+    Search {
+        forge: Option<String>,
+        term: String,
     },
     Url(String),
     Local(PathBuf),
@@ -83,6 +97,28 @@ impl PkgSpec {
             _ => (None, body),
         };
 
+        // Search form: a single slug with no '/' — `name` or `forge:name`.
+        // (An explicit `forge:owner/repo` still bypasses ranking.)
+        if !rest.contains('/') {
+            if rest.is_empty() {
+                return Err(GitfullError::Spec(format!(
+                    "`{input}`: empty search term"
+                )));
+            }
+            if !valid_slug(rest) {
+                return Err(GitfullError::Spec(format!(
+                    "`{input}`: invalid search term `{rest}`"
+                )));
+            }
+            return Ok(PkgSpec {
+                source: Source::Search {
+                    forge,
+                    term: rest.to_string(),
+                },
+                git_ref,
+            });
+        }
+
         let (owner, repo) = rest.rsplit_once('/').ok_or_else(|| {
             GitfullError::Spec(format!(
                 "`{input}`: expected owner/repo (got `{rest}`); forms: \
@@ -117,10 +153,14 @@ impl PkgSpec {
     }
 
     /// Lookup key for `[repo."..."]` overrides: `owner/repo`, the URL, or
-    /// the local path.
+    /// the local path. Search specs have no key until resolved.
     pub fn key(&self) -> String {
         match &self.source {
             Source::Forge { owner, repo, .. } => format!("{owner}/{repo}"),
+            Source::Search { forge, term } => match forge {
+                Some(f) => format!("{f}:{term}"),
+                None => term.clone(),
+            },
             Source::Url(u) => u.clone(),
             Source::Local(p) => p.display().to_string(),
         }
@@ -167,6 +207,35 @@ mod tests {
     }
 
     #[test]
+    fn search_forms() {
+        // bare name → search across all configured forges
+        let p = PkgSpec::parse("hello").unwrap();
+        assert_eq!(
+            p.source,
+            Source::Search {
+                forge: None,
+                term: "hello".into()
+            }
+        );
+        // forge-scoped search
+        let p = PkgSpec::parse("codeberg:hello").unwrap();
+        assert_eq!(
+            p.source,
+            Source::Search {
+                forge: Some("codeberg".into()),
+                term: "hello".into()
+            }
+        );
+        // search + pinned ref carries the ref through resolution
+        let p = PkgSpec::parse("hello@v1.2").unwrap();
+        assert_eq!(p.git_ref.as_deref(), Some("v1.2"));
+        assert!(matches!(p.source, Source::Search { .. }));
+        // case sensitivity: forge names lowercased by callers, but parsing
+        // keeps them verbatim (registry lookup handles it)
+        assert!(PkgSpec::parse("no-such").is_ok());
+    }
+
+    #[test]
     fn url_and_local() {
         let p = PkgSpec::parse("https://gitlab.com/g/s/p.git").unwrap();
         assert_eq!(p.source, Source::Url("https://gitlab.com/g/s/p.git".into()));
@@ -176,16 +245,17 @@ mod tests {
 
     #[test]
     fn invalid_specs() {
-        // note: "/repo" is NOT invalid — leading '/' means a local path
+        // note: "/repo" is NOT invalid — leading '/' means a local path;
+        // "repo" (no slash) is likewise valid now — it is a SEARCH term
         for bad in [
             "",
-            "repo",
             "owner/",
             "o/r@bad/ref",
             "o/r@",
             "forge!:o/r",
             "own er/repo",
             "a//b",
+            "forge:",
         ] {
             assert!(PkgSpec::parse(bad).is_err(), "expected error for `{bad}`");
         }
