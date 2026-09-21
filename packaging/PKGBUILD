@@ -1,0 +1,67 @@
+# gitfull — Arch Linux package build.
+#
+# Quick path:  ./packaging/build-arch.sh   (stages a copy of this file with
+# the real source checksum injected, then runs makepkg).
+# Manual path: copy this PKGBUILD and the gitfull-<ver>.tar.gz produced by
+# packaging/make-archive.sh into one directory and run `makepkg -f` there.
+#
+# Design notes (docs/PACKAGING.md has the full rationale):
+#   * binary -> /usr/bin/gitfull: distro-owned tree. /usr/local/bin stays
+#     gitfull's own territory for the apps IT installs (default bin_dir).
+#   * /etc/gitfull.conf.example only — the user's /etc/gitfull.conf is
+#     never owned by this package, so upgrades can never touch it.
+#     backup=() gives the example pacman's modified-file handling.
+#   * nothing creates /var/lib/gitfull at package install time: gitfull
+#     creates it on the first state-changing run (cfg.ensure_root()).
+
+pkgname=gitfull
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Forge-agnostic package manager that treats Git-forge-hosted repositories as installable packages'
+arch=('x86_64' 'aarch64')
+url='https://github.com/FemBoyGamerTechGuy/GitFull'
+# SPDX-style reference for a license outside the SPDX list; older pacman
+# versions merely warn about the unknown license string.
+license=('LicenseRef-Proprietary')
+# gitfull execs exactly two host tools at runtime (git for clones,
+# curl for downloads and read-only forge search); everything else it
+# builds itself as toolchains.
+depends=('git' 'curl')
+makedepends=('cargo')
+source=("gitfull-${pkgver}.tar.gz")
+# Filled in by packaging/build-arch.sh from the deterministic
+# git-archive tarball; upstream releases record the tagged checksum.
+sha256sums=('SKIP')
+
+# .pacnew/.pacsave handling for a locally modified example conf.
+backup=('etc/gitfull.conf.example')
+
+build() {
+    cd "gitfull-${pkgver}"
+    cargo build --release --locked
+}
+
+# Runs the offline test suite (96+ tests) when makepkg is invoked with
+# --check; skip with --nocheck.
+check() {
+    cd "gitfull-${pkgver}"
+    cargo test --release --locked --quiet
+}
+
+package() {
+    cd "gitfull-${pkgver}"
+    install -Dm755 target/release/gitfull "${pkgdir}/usr/bin/gitfull"
+    install -Dm644 config/gitfull.conf.example \
+        "${pkgdir}/etc/gitfull.conf.example"
+    install -Dm644 docs/gitfull.1 \
+        "${pkgdir}/usr/share/man/man1/gitfull.1"
+    # -n: no timestamp/name in the gzip header -> reproducible output
+    gzip -9n "${pkgdir}/usr/share/man/man1/gitfull.1"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/gitfull/LICENSE"
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/gitfull/README.md"
+    local doc
+    for doc in docs/ARCHITECTURE.md docs/AUDIT.md docs/CONFIG.md \
+               docs/PACKAGING.md; do
+        install -Dm644 "${doc}" "${pkgdir}/usr/share/doc/gitfull/${doc##*/}"
+    done
+}

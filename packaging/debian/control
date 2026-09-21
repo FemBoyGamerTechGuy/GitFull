@@ -1,0 +1,23 @@
+Source: gitfull
+Section: utils
+Priority: optional
+Maintainer: FemBoyGamerTechGuy <FemBoyGamerTechGuy@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+ cargo
+Standards-Version: 4.7.0
+Homepage: https://github.com/FemBoyGamerTechGuy/GitFull
+
+Package: gitfull
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}, git, curl
+Description: Forge-agnostic package manager for Git-forge-hosted repositories
+ gitfull treats any Git forge — GitHub, GitLab, Gitea, Codeberg, or
+ self-hosted — as an installable package source: repositories are cloned
+ into a per-app sandbox that gitfull manages, required toolchains are
+ provisioned from source, and exactly one artifact crosses the sandbox
+ boundary: the final binary, hashed and audit-logged.
+ .
+ The host compiler is used exactly once (to build the seed GCC). No OS
+ package manager is invoked by gitfull at runtime; the binary itself
+ depends only on serde and toml. Proprietary software — all rights
+ reserved.

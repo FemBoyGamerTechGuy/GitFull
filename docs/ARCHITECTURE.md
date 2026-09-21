@@ -277,6 +277,14 @@ fully-specified child env, audit-log append with secret redaction.
   resolution printed, `forge:name` scoping, no-match errors);
 * privilege: root required for install/update/remove on system paths,
   both-paths-overridden dev mode allowed, read-only commands ungated;
+* packaging (tests/packaging.rs): distro recipes stay in sync — version
+  strings match Cargo.toml across PKGBUILD / RPM spec / debian
+  changelog / xbps template / man page, git+curl declared as the only
+  runtime deps, no recipe code references `/var/lib` (packages create
+  no runtime state at install time — gitfull's first state-changing
+  run does), no maintainer scripts / RPM scriptlets, and the shipped
+  example conf carries each format's no-clobber semantics
+  (docs/PACKAGING.md);
 * NOT tested here by design: the seed-GCC *execution* and component
   builds (they need a full Linux machine) and live forge APIs; their
   plan generation, version resolution, classification, URL building,

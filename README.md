@@ -130,6 +130,36 @@ gitfull: install record: /var/lib/gitfull/apps/github-mesonbuild-meson/meta.toml
 (The first install takes a while: it builds the toolchain components from
 source, once, shared with every later install.)
 
+## Installation
+
+Build from source:
+
+```console
+$ cargo build --release
+$ sudo install -m755 target/release/gitfull /usr/local/bin/gitfull
+$ sudo cp config/gitfull.conf.example /etc/gitfull.conf   # optional; see docs/CONFIG.md
+```
+
+Or as a distro-native package — recipes in `packaging/` (PKGBUILD,
+debian/, gitfull.spec, xbps-src template), built by
+`packaging/build-{arch,deb,rpm}.sh`, documented in
+**[docs/PACKAGING.md](docs/PACKAGING.md)**:
+
+```console
+$ sudo pacman -U gitfull-0.1.0-1-x86_64.pkg.tar.zst    # Arch
+$ sudo apt install ./gitfull_0.1.0_amd64.deb            # Debian/Ubuntu
+$ sudo dnf install ./gitfull-0.1.0-1.fc42.x86_64.rpm    # Fedora/RHEL
+$ sudo xbps-install -R . gitfull                        # Void
+```
+
+Packages install `/usr/bin/gitfull` (distro-owned tree —
+`/usr/local/bin` stays gitfull's own territory for the apps it
+installs), `/etc/gitfull.conf.example` (never your
+`/etc/gitfull.conf`, with each format's no-clobber semantics), the man
+page, and the docs. They declare exactly `git` + `curl` as runtime
+dependencies and contain no install-time scripts: `/var/lib/gitfull`
+is created by gitfull itself on the first state-changing run.
+
 ## Isolation model (short version)
 
 ```
@@ -191,16 +221,17 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)** · annotated example:
 |---|---|
 | [docs/AUDIT.md](docs/AUDIT.md) | the two special paths (seed GCC host-touch, final-binary sandbox-escape), exec classes, denylist, env hermeticity, license posture |
 | [docs/CONFIG.md](docs/CONFIG.md) | complete `/etc/gitfull.conf` schema reference + forge extensibility guide |
+| [docs/PACKAGING.md](docs/PACKAGING.md) | distro-native packaging recipes (Arch PKGBUILD, Debian, RPM, Void) + release-cutting checklist |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | module map, install pipeline, sandbox/toolchain layout, resolver design |
 
 ## Build & test
 
 ```console
 $ cargo build --release
-$ cargo test            # 96 tests: config, forge, spec/search, progress
+$ cargo test            # 102 tests: config, forge, spec/search, progress
                         # parsing, privilege model, ranked search (fake
                         # forge API), policy enforcement, hermetic env,
-                        # e2e sandboxed install
+                        # e2e sandboxed install, packaging recipes
 ```
 
 gitfull itself depends on exactly two crates — `serde` and `toml`
@@ -248,7 +279,8 @@ toolchain manager (seed-GCC bootstrap plan + shared versioned installs,
 auto-detection, **ranked multi-forge search for bare package names**,
 **root-privilege enforcement for all state-changing operations**, clone
 progress UI, exec chokepoint + audit log, and the install/remove/list/
-update pipeline are implemented and tested (96 tests). The seed-GCC
+update pipeline are implemented and tested (102 tests, incl.
+distro-packaging recipe consistency). The seed-GCC
 *execution* path targets a full Linux machine and is intentionally not
 exercised in restricted development environments — its plan, version
 resolution, and exec classification are tested.

@@ -1,0 +1,7 @@
+gitfull (0.1.0) unstable; urgency=medium
+
+  * Initial packaging of gitfull 0.1.0: forge-agnostic package manager
+    with root privilege model, automatic toolchain provisioning, and
+    ranked multi-forge search for bare package names.
+
+ -- FemBoyGamerTechGuy <FemBoyGamerTechGuy@users.noreply.github.com>  Mon, 21 Sep 2026 20:00:00 +0000

@@ -1,0 +1,50 @@
+# Template file for 'gitfull' (Void Linux, xbps-src).
+#
+# Build: clone void-packages, place this file at srcpkgs/gitfull/template,
+# record the source checksum (xgensum gitfull), then:
+#   ./xbps-src -m x86_64 pkg gitfull
+# Install from the local repository:
+#   xbps-install --repository <void-packages>/masterdir-x86_64/hostdir/binpkgs gitfull
+#
+# Design notes (docs/PACKAGING.md has the full rationale):
+#   * build_style=cargo builds with `cargo build --release` and installs
+#     the binary to /usr/bin — the distro-owned tree. /usr/local/bin
+#     stays gitfull's own territory for the apps IT installs.
+#   * /etc/gitfull.conf.example only, listed in conf_files — the user's
+#     /etc/gitfull.conf is never owned by this package.
+#   * nothing creates /var/lib/gitfull at package-install time: gitfull
+#     creates it on the first state-changing run (cfg.ensure_root()).
+
+pkgname=gitfull
+version=0.1.0
+revision=1
+build_style=cargo
+hostmakedepends="cargo"
+# gitfull execs exactly two host tools at runtime (git for clones, curl
+# for downloads and read-only forge search); everything else it builds
+# itself as toolchains.
+depends="git curl"
+short_desc="Forge-agnostic package manager for Git-forge-hosted repositories"
+maintainer="FemBoyGamerTechGuy <FemBoyGamerTechGuy@users.noreply.github.com>"
+license="Proprietary - all rights reserved (see /usr/share/licenses/gitfull/LICENSE)"
+homepage="https://github.com/FemBoyGamerTechGuy/GitFull"
+# The deterministic git-archive tarball attached to each release (see
+# packaging/make-archive.sh + docs/PACKAGING.md).
+distfiles="https://github.com/FemBoyGamerTechGuy/GitFull/releases/download/v${version}/gitfull-${version}.tar.gz"
+# Record the sha256 of the tagged release archive: run `xgensum gitfull`
+# in your void-packages checkout, or paste the checksum printed by
+# packaging/make-archive.sh for the release tag.
+checksum=REPLACE_WITH_RELEASE_SHA256
+
+conf_files="/etc/gitfull.conf.example"
+
+post_install() {
+	vinstall config/gitfull.conf.example 644 etc gitfull.conf.example
+	vinstall docs/gitfull.1 644 usr/share/man/man1
+	vlicense LICENSE
+	vdoc README.md
+	vdoc docs/ARCHITECTURE.md
+	vdoc docs/AUDIT.md
+	vdoc docs/CONFIG.md
+	vdoc docs/PACKAGING.md
+}

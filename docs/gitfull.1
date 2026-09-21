@@ -1,0 +1,151 @@
+.TH GITFULL 1 "2026-09-21" "gitfull 0.1.0" "User Commands"
+.\" Man page for gitfull. Kept in sync with src/main.rs usage() and the
+.\" crate version by tests/packaging.rs. Installed by every distro package
+.\" (see docs/PACKAGING.md).
+.SH NAME
+gitfull \- forge-agnostic package manager for Git-forge-hosted repositories
+.SH SYNOPSIS
+.B gitfull
+.RI [ options ]
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B gitfull
+treats any Git-forge-hosted repository as an installable package:
+GitHub, GitLab, Gitea, Codeberg, or any self-hosted forge.
+Each install clones the repository into a per-app sandbox that gitfull
+manages, provisions the toolchains the build needs (from source, with
+the host compiler used exactly once, for the seed GCC), builds there,
+and copies exactly one artifact out: the final binary, hashed and
+audit-logged, into the configured bin directory.
+.PP
+A bare package name triggers ranked multi-forge search: every
+configured forge is queried, candidates are scored by stars,
+contributors, commit count, and recency, the ranked table and the
+chosen repository are printed before anything is cloned or built, and
+the top match is auto-selected.
+.PP
+No OS package manager is ever invoked by gitfull; every subprocess
+spawn passes a single audited exec chokepoint.
+.PP
+All state-changing commands require root: run them as
+.B "sudo gitfull install ...",
+.B "sudo gitfull remove ...",
+and so on. Read-only commands never do.
+.SH COMMANDS
+.SS State-changing (run as root)
+.TP
+.BI "install " "spec ..."
+Install packages. Missing toolchain components are fetched and built
+automatically.
+.TP
+.BI "update " "name ..."
+Re-clone and rebuild installed packages; with no names, all installed
+packages.
+.TP
+.BI "remove " "name ..."
+Remove installed packages, verifying recorded hashes first.
+.TP
+.BI "toolchain bootstrap-gcc " "option..."
+Optional manual seed-GCC build;
+.B install
+does this automatically when needed.
+.TP
+.BI "toolchain build " "component option..."
+Optional manual toolchain component build.
+.SS Read-only (no root required)
+.TP
+.B list
+List installed packages.
+.TP
+.BI "info " query
+Show the install record, or the ranked forge resolution for a bare
+name.
+.TP
+.B toolchain\ list
+Show the toolchain catalog and installed versions.
+.TP
+.B doctor
+Environment readiness checks.
+.TP
+.B "config show | validate | path"
+Inspect the configuration file.
+.TP
+.BI "audit " "N"
+Show the last \fIN\fR audit events (default 20).
+.SH PACKAGE SPECS
+.TP
+.I name
+Ranked search across all configured forges; the resolution is printed
+before anything happens.
+.TP
+.I forge:name
+Ranked search scoped to one forge.
+.TP
+.I owner/repo
+Default forge, no search.
+.TP
+.I forge:owner/repo
+Explicit forge; bypasses ranking.
+.TP
+.IR owner/repo @ ref
+Pinned branch, tag, or commit.
+.TP
+.I https://host/owner/repo.git
+Full URL, matched against configured forges.
+.TP
+.I /abs/path
+Local source tree (no network).
+.SH OPTIONS
+Global options precede the command:
+.TP
+.BI \-\-config " path"
+Configuration file (default \fI/etc/gitfull.conf\fR).
+.TP
+.BI \-\-root " path"
+Override the sandbox root.
+.TP
+.B \-\-dry\-run
+Resolve and plan only.
+.TP
+.B \-\-yes\fR, \fB\-y
+Assume yes.
+.TP
+.B \-\-no\-color
+Disable colors; \fB\-\-color auto|always|never\fR selects explicitly.
+.TP
+.B \-\-verbose\fR, \fB\-v
+Echo build commands.
+.TP
+.B \-\-version\fR, \fB\-V
+Print the version. \fB\-\-help\fR, \fB\-h\fR prints full help.
+.SH EXIT STATUS
+0 success; 2 usage error; 3 policy or privilege violation; 4 build
+failure; 5 package not installed.
+.SH FILES
+.TP
+.I /etc/gitfull.conf
+Configuration. Never created or modified by gitfull or by the distro
+packages; start from \fI/etc/gitfull.conf.example\fR.
+.TP
+.I /var/lib/gitfull
+Sandbox root: per-app sandboxes, shared toolchains, cache, logs, and
+the audit log. Created by gitfull on the first state-changing run, not
+at package install time.
+.SH EXAMPLES
+.PP
+sudo gitfull install meson
+.RS
+Ranked search across configured forges, then a sandboxed build with
+automatic toolchain provisioning.
+.RE
+.PP
+gitfull info meson
+.RS
+Show the ranked resolution read-only.
+.RE
+.SH SEE ALSO
+Full documentation ships in \fI/usr/share/doc/gitfull\fR (README,
+ARCHITECTURE, AUDIT, CONFIG, PACKAGING).
+.SH LICENSE
+Proprietary \(em all rights reserved.

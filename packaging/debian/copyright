@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: gitfull
+Source: https://github.com/FemBoyGamerTechGuy/GitFull
+
+Files: *
+Copyright: 2026 FemBoyGamerTechGuy
+License: proprietary
+ gitfull is proprietary software — all rights reserved. The full
+ license text is installed at /usr/share/doc/gitfull/LICENSE.
