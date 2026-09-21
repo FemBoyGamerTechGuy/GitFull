@@ -212,6 +212,9 @@ impl Fixture {
             extra_forbidden: Vec::new(),
             redactions: Vec::new(),
             resolve_path: cfg.host_tool_path.clone(),
+            // simulate a non-interactive session: tests never prompt and
+            // never depend on the runner's ambient fd state
+            interactive_override: Some(false),
         }
     }
 }

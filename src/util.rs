@@ -33,6 +33,27 @@ pub fn is_tty(fd: u32) -> bool {
     }
 }
 
+/// Is there a real interactive terminal on BOTH ends of a prompt —
+/// stdout (where the question is printed) and stdin (where the answer is
+/// read)?
+///
+/// Both ends must be terminals. A question printed to a captured or piped
+/// stdout (CI logs, `cargo test` output capture, `… | tee`) is invisible,
+/// and a read from a non-terminal stdin (pipe, file, `/dev/null`, closed
+/// fd) never yields a human answer — it either returns garbage
+/// immediately or blocks forever. Callers must treat `false` as "no
+/// prompting is possible" and take their non-interactive path
+/// **immediately**: never print the question, never attempt the read.
+///
+/// This is the classic `isatty(0) && isatty(1)` prompt-safety idiom (as
+/// used by apt, git and ssh), which single-ended checks get wrong: a
+/// session whose stdin is still an inherited terminal (makepkg run from
+/// a console, a build coordinator's pty, a chroot `/dev/console`) is NOT
+/// interactive just because fd 0 happens to look like a TTY.
+pub fn is_interactive() -> bool {
+    is_tty(0) && is_tty(1)
+}
+
 /// Terminal width from `$COLUMNS`, defaulting to 80.
 pub fn term_width() -> usize {
     env::var("COLUMNS")

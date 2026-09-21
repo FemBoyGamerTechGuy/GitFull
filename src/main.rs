@@ -237,6 +237,10 @@ fn base_ctx(cfg: &Config, mutating: bool) -> ExecCtx {
         extra_forbidden: cfg.policy.extra_forbidden_programs.clone(),
         redactions: Vec::new(),
         resolve_path: cfg.host_tool_path.clone(),
+        // None = auto-detect: prompts only when BOTH stdin and stdout are
+        // real terminals (util::is_interactive) — a non-interactive run
+        // hard-errors at the unconfirmed-search gate instead of blocking
+        interactive_override: None,
     }
 }
 

@@ -183,16 +183,23 @@ popularity ranking cannot establish upstream identity for a library
 module name. gitfull prints the ranked candidates flagged UNCONFIRMED
 and proceeds only if
 
-* the invocation is interactive (TTY) and you confirm the top match
-  with `y` (gitfull then prints the exact `[dep]` pin to make the
-  choice reproducible), or
+* the invocation is interactive — a real terminal on **both ends of
+  the prompt** (stdout where the question is printed, stdin where the
+  answer is read) — and you confirm the top match with `y` (gitfull
+  then prints the exact `[dep]` pin to make the choice reproducible),
+  or
 * you pin the name in gitfull.conf (the path for scripts, CI and
   `--dry-run`-style automation; `--yes` deliberately does NOT bypass
   this gate).
 
-Non-interactive invocations without a pin fail with the candidate
-table and the pin syntax — never a silent build of a rank-1 match,
-however many stars it has.
+Every other environment — piped or captured stdout (CI logs, `… |
+tee`), non-TTY stdin, or the inherited-but-unserviced terminal that
+packaging pipelines and test runners leave on fd 0 — is
+non-interactive: gitfull **fails immediately** with the candidate
+table and the pin syntax. It never attempts the blocking stdin read
+at all (that read would hang the build indefinitely, with the
+question invisible under output capture) — and never a silent build
+of a rank-1 match, however many stars it has.
 
 ## 5. `[paths]` — directory overrides
 

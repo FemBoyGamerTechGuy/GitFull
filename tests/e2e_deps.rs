@@ -24,7 +24,8 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use gitfull::config::Config;
 use gitfull::gitproc::ExecCtx;
@@ -239,6 +240,14 @@ int main(void) {
             extra_forbidden: Vec::new(),
             redactions: Vec::new(),
             resolve_path: cfg.host_tool_path.clone(),
+            // simulate a NON-interactive session explicitly: e2e tests
+            // must never prompt — and never depend on whatever fd state
+            // the test runner inherited. This is the deterministic seam
+            // that makes the unconfirmed-search gate take its hard-error
+            // path even when `cargo test` runs on a real terminal (the
+            // makepkg/CI packaging scenario where an inherited-but-
+            // unserviced TTY on fd 0 used to hang the build forever).
+            interactive_override: Some(false),
         }
     }
 
@@ -286,6 +295,65 @@ fn libs_entries(cfg: &Config) -> Vec<(String, PathBuf)> {
     }
     out.sort();
     out
+}
+
+// ---------------------------------------------------------------------------
+// hard-timeout watchdog: a prompt regression must fail loudly, not hang
+// ---------------------------------------------------------------------------
+
+/// Run a test body on a worker thread under a HARD deadline.
+///
+/// Why this exists: these e2e tests drive the REAL install flow, which
+/// contains interactive confirmation gates. The fixtures pin
+/// `interactive_override: Some(false)` so those gates deterministically
+/// take the non-interactive hard-error path — but if a regression ever
+/// reintroduces a blocking stdin read on an inherited-but-unserviced
+/// terminal (the exact packaging hang: `cargo test` inside makepkg/CI,
+/// fd 0 still a TTY that nobody answers, prompt invisible under output
+/// capture), the test would block forever and take the whole build down
+/// with no output. The watchdog turns that into a loud, fast failure.
+///
+/// A worker thread blocked in a read cannot be interrupted — but it also
+/// cannot prevent process exit: the panic below fails THIS test, the run
+/// finishes, and the leaked thread dies with the process.
+fn with_hard_timeout<T, F>(label: &str, secs: u64, body: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<std::thread::Result<T>>();
+    std::thread::Builder::new()
+        .name(format!("e2e-watchdog-{label}"))
+        .spawn(move || {
+            // body panics (assertion failures) are forwarded to the main
+            // test thread, which re-panics with the original message
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)));
+        })
+        .expect("spawn watchdog worker");
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(panic)) => panic!("{label}: test body failed: {}", panic_message(&panic)),
+        Err(_) => panic!(
+            "{label}: HARD TIMEOUT after {secs}s — the test body is blocked, \
+             almost certainly on an interactive prompt reading inherited \
+             stdin from a non-interactive session. This is the packaging-hang \
+             regression (makepkg/CI `cargo test` with an unserviced TTY on \
+             fd 0): a prompt gate must hard-error immediately instead of \
+             ever attempting a blocking read."
+        ),
+    }
+}
+
+/// Recover the message of a forwarded panic (assertion failures carry
+/// `String`/`&'static str` payloads; anything else still reports).
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(non-string panic payload)".into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +754,26 @@ fn search_fallback_is_flagged_unconfirmed_and_requires_a_pin() {
         eprintln!("skipping deps e2e search: curl not present");
         return;
     }
+    // HARD deadline around the whole scenario (fake-forge setup, both
+    // install phases, all assertions): even if a future regression
+    // makes a confirmation gate block on inherited stdin again, this
+    // test fails loudly within the deadline instead of hanging the
+    // packaging build (makepkg check() / CI) indefinitely.
+    with_hard_timeout("search-fallback-gate", 60, || {
+        search_fallback_gate_body()
+    });
+}
+
+/// The actual scenario: `fake-zlib` is covered by no curated mapping, no
+/// `[dep]` pin, no wrap and no cached build — the only resolution layer
+/// left is ranked forge search, whose result must be REFUSED as
+/// UNCONFIRMED (nothing cloned, nothing built), and the same setup with
+/// an explicit `[dep]` pin must then install and link normally.
+///
+/// The session is deterministically non-interactive (`Fixture::ctx` pins
+/// `interactive_override: Some(false)`), so the refusal is the hard-error
+/// path — independent of whatever TTY state `cargo test` itself inherited.
+fn search_fallback_gate_body() {
     // staging area for the fake forge + its servable git repo — a path
     // DISJOINT from the fixture root (the fixture constructor wipes its
     // own root, which would otherwise destroy the docroot)
@@ -702,7 +790,9 @@ fn search_fallback_is_flagged_unconfirmed_and_requires_a_pin() {
     // fixture with a github-kind forge pointed at the fake server — NO
     // [dep] overrides and `fake-zlib` is NOT in the curated map, so the
     // only resolution layer left is ranked search… whose result must be
-    // REFUSED as unconfirmed (tests run non-interactively: no TTY)
+    // REFUSED as unconfirmed (the fixture's ctx pins a NON-interactive
+    // session explicitly — the refusal does not depend on the ambient
+    // TTY state the test runner happened to inherit)
     let forge_conf = format!(
         "\n[forge.github]\nkind = \"github\"\nhost = \"127.0.0.1\"\napi_base = \"{api}\"\nclone_template = \"{api}/{{owner}}/{{repo}}.git\"\n\n\
          [forge.gitlab]\nkind = \"gitlab\"\nhost = \"fake.invalid\"\n\n\

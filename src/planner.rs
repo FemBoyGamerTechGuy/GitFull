@@ -1116,8 +1116,15 @@ fn plan_dep_fetch(cfg: &Config, spec: &DepSpec) -> Result<PlannedFetch> {
 /// `--yes` deliberately does NOT bypass this gate: it suppresses
 /// *prompts*, not the missing confirmation itself.
 ///
-/// `tty` and `read_line` are parameters so tests can drive both sides
-/// without a real terminal.
+/// `tty` decides WHICH path runs — and when it is false the hard error
+/// returns immediately, with **no blocking stdin read attempted at all**.
+/// Callers must derive it from a both-ends-of-the-prompt check
+/// ([`ExecCtx::interactive`] — stdin AND stdout real terminals), never
+/// from stdin alone: an inherited-but-unserviced terminal on fd 0
+/// (makepkg/CI/packaging builds) must not be mistaken for a human who
+/// can answer. `tty` and `read_line` are parameters so tests can drive
+/// both sides without a real terminal — and without depending on the
+/// ambient fd state the test runner happened to inherit.
 fn confirm_unconfirmed_search_dep(
     name: &str,
     cands: &[search::Candidate],
@@ -1183,6 +1190,10 @@ fn confirm_unconfirmed_search_dep(
 
 /// Read one line from the real stdin (the interactive confirmation
 /// path; tests inject their own closure instead).
+///
+/// ONLY reachable behind a both-ends TTY check ([`ExecCtx::interactive`]):
+/// a blocking read anywhere else is the packaging-pipeline hang — a
+/// non-interactive session must fail fast instead of waiting forever.
 fn read_stdin_line() -> Option<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok().map(|_| line)
@@ -1257,10 +1268,14 @@ fn plan_scan(
                         d.name
                     );
                 } else {
+                    // non-interactive sessions (no real terminal on BOTH
+                    // ends of the prompt) hard-error HERE — the read is
+                    // only ever attempted behind a both-fds TTY check,
+                    // never on an inherited fd nobody is servicing
                     let spec = confirm_unconfirmed_search_dep(
                         &d.name,
                         &cands,
-                        util::is_tty(0),
+                        ctx.interactive(),
                         &read_stdin_line,
                     )?;
                     queue.push_back(QueuedDep {
@@ -1362,9 +1377,12 @@ pub fn install(
 
     let sb = Sandbox::for_app(&cfg.apps_dir, &sandbox_name);
 
-    // Reinstall handling
+    // Reinstall handling — the prompt is only ever attempted when the
+    // session is interactive on BOTH ends (prompt visible on stdout,
+    // answerable from stdin); non-interactive runs proceed straight
+    // to the reinstall (opts.yes) without any blocking read
     if sb.meta_path().exists() {
-        if !opts.yes && util::is_tty(0) {
+        if !opts.yes && base_ctx.interactive() {
             print!("gitfull: `{sandbox_name}` is already installed — reinstall? [y/N] ");
             use std::io::Write;
             std::io::stdout().flush().ok();
@@ -2167,6 +2185,7 @@ pub fn info(cfg: &Config, query: &str) -> Result<()> {
                 extra_forbidden: cfg.policy.extra_forbidden_programs.clone(),
                 redactions: Vec::new(),
                 resolve_path: cfg.host_tool_path.clone(),
+                interactive_override: None,
             };
             search::resolve(cfg, &ctx, &spec)?
         }
@@ -2240,6 +2259,9 @@ mod tests {
             extra_forbidden: Vec::new(),
             redactions: Vec::new(),
             resolve_path: cfg.host_tool_path.clone(),
+            // deterministic non-interactive session: unit tests never
+            // prompt regardless of the ambient fds the runner inherited
+            interactive_override: Some(false),
         }
     }
 
@@ -2383,6 +2405,72 @@ mod tests {
             score: 0.58,
         }];
         assert!(confirm_unconfirmed_search_dep("cairo", &popular, false, &|| None).is_err());
+    }
+
+    /// The interactivity seam that makes the gate hang-proof:
+    ///
+    /// * `None` (production CLI) auto-detects with the BOTH-ends prompt
+    ///   check — stdin AND stdout must be real terminals, never stdin
+    ///   alone (an inherited-but-unserviced terminal on fd 0 is exactly
+    ///   the makepkg/CI packaging hang);
+    /// * `Some(false)` (tests, embedders) forces the non-interactive
+    ///   hard-error path deterministically, whatever fds the test runner
+    ///   inherited;
+    /// * `Some(true)` forces the prompt path.
+    #[test]
+    fn interactive_sessions_are_decided_by_both_prompt_ends() {
+        assert_eq!(
+            util::is_interactive(),
+            util::is_tty(0) && util::is_tty(1),
+            "is_interactive is the classic isatty(0) && isatty(1) prompt \
+             check — a single-ended check mistakes an inherited terminal \
+             for a human and hangs packaging builds"
+        );
+        let auto = ExecCtx {
+            interactive_override: None,
+            ..ExecCtx::default()
+        };
+        assert_eq!(auto.interactive(), util::is_interactive());
+        let forced_off = ExecCtx {
+            interactive_override: Some(false),
+            ..ExecCtx::default()
+        };
+        assert!(!forced_off.interactive());
+        let forced_on = ExecCtx {
+            interactive_override: Some(true),
+            ..ExecCtx::default()
+        };
+        assert!(forced_on.interactive());
+
+        // the shipped gate: a forced non-interactive session hard-errors
+        // IMMEDIATELY — the read closure must never even be consulted
+        // (this is the deterministic simulation of "no TTY present")
+        let cands = vec![search::Candidate {
+            forge: "github".into(),
+            owner: "someone".into(),
+            repo: "coursework-gee".into(),
+            stars: 2.0,
+            contributors: Some(1.0),
+            commits: Some(3.0),
+            last_activity: Some(util::epoch() - 90 * 86400),
+            score: 0.12,
+        }];
+        let read_attempted = std::cell::Cell::new(false);
+        let err = confirm_unconfirmed_search_dep(
+            "gee-0.8",
+            &cands,
+            forced_off.interactive(),
+            &|| {
+                read_attempted.set(true);
+                Some("y\n".into()) // would BUILD if the gate were wrong
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !read_attempted.get(),
+            "no blocking read may be attempted at all in a non-interactive session"
+        );
+        assert!(format!("{err}").contains("UNCONFIRMED"), "{err}");
     }
 
     /// Generic (non-forge) git URLs plan to a plain anonymous fetch —

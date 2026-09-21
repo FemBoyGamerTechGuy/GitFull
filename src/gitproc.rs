@@ -116,18 +116,46 @@ impl ExecClass {
 /// Execution context: audit log target, policy extensions, secrets to
 /// redact from logs, and the PATH used to resolve bare program names (the
 /// child's hermetic PATH — never implicitly the host's).
+///
+/// `interactive_override` is the prompt-policy seam: `None` auto-detects
+/// from the real terminal state, `Some(_)` forces a deterministic answer
+/// (tests simulate a non-interactive session no matter what fds they
+/// inherited from the test runner).
 #[derive(Debug, Clone, Default)]
 pub struct ExecCtx {
     pub audit_log: Option<PathBuf>,
     pub extra_forbidden: Vec<String>,
     pub redactions: Vec<String>,
     pub resolve_path: String,
+    /// `None` = detect interactivity from the real terminal state;
+    /// `Some(false)` = this session may never prompt (tests, embedders);
+    /// `Some(true)` = prompts allowed regardless of ambient fds.
+    pub interactive_override: Option<bool>,
 }
 
 impl ExecCtx {
     pub fn forbidden(&self, program: &str) -> bool {
         let base = basename(program);
         BUILTIN_FORBIDDEN.contains(&base) || self.extra_forbidden.iter().any(|x| x == base)
+    }
+
+    /// May this session show an interactive prompt and read the answer?
+    ///
+    /// Auto-detection requires BOTH ends of the prompt to be real
+    /// terminals: the question is written to stdout, the answer read from
+    /// stdin (see [`crate::util::is_interactive`]). Either end not a TTY —
+    /// piped stdout, captured test output, `/dev/null` stdin, an inherited
+    /// but unserviced pty — means the prompt can never be seen and/or
+    /// answered.
+    ///
+    /// Callers MUST treat `false` as "take the non-interactive path
+    /// immediately": print nothing, attempt NO blocking stdin read. A
+    /// blocking read under a false-positive TTY check is exactly the
+    /// packaging-pipeline hang (`cargo test` inside `makepkg`/CI inheriting
+    /// a terminal on fd 0 that nobody is typing into).
+    pub fn interactive(&self) -> bool {
+        self.interactive_override
+            .unwrap_or_else(crate::util::is_interactive)
     }
 }
 

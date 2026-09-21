@@ -140,7 +140,16 @@ working tree is never touched. Manual path: copy `packaging/PKGBUILD`
 and the archive into one directory, fix `sha256sums=()`, `makepkg -f`.
 
 `check()` runs the offline test suite when makepkg is invoked with
-`--check` (skip with `--nocheck`). Install and verify:
+`--check` (skip with `--nocheck`). The suite is safe in exactly this
+environment: every test simulates a non-interactive session explicitly
+(`interactive_override`), so confirmation gates deterministically take
+their hard-error path instead of reading inherited stdin — an
+inherited-but-unserviced terminal on fd 0 (makepkg from a console, a
+build coordinator's pty) cannot hang the build — and the
+unconfirmed-search gate test runs under a hard 60 s watchdog that
+turns any prompt-read regression into a loud, fast failure. Verified
+with `cargo test --release --locked --quiet </dev/null` and under an
+alloc PTY that is never written to. Install and verify:
 
 ```console
 $ sudo pacman -U dist/gitfull-0.1.0-1-x86_64.pkg.tar.zst

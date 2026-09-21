@@ -11,6 +11,7 @@ fn ctx(extra: &[&str], path: &str) -> ExecCtx {
         extra_forbidden: extra.iter().map(|s| s.to_string()).collect(),
         redactions: Vec::new(),
         resolve_path: path.to_string(),
+        interactive_override: None,
     }
 }
 
@@ -147,6 +148,7 @@ fn secrets_are_redacted() {
         extra_forbidden: Vec::new(),
         redactions: vec!["github_pat_SUPERSECRET".to_string()],
         resolve_path: "/usr/bin:/bin".to_string(),
+        interactive_override: None,
     };
     // redaction applies to args when writing logs; simulate via the same
     // helper logic used in gitproc (exported behavior: check the deny path

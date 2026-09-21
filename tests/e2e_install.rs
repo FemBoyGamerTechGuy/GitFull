@@ -115,6 +115,10 @@ int main(void) {
             extra_forbidden: Vec::new(),
             redactions: Vec::new(),
             resolve_path: cfg.host_tool_path.clone(),
+            // simulate a non-interactive session: e2e tests never prompt,
+            // no matter which fds the test runner inherited (TTY-state
+            // independence — see the packaging hang this prevents)
+            interactive_override: Some(false),
         }
     }
 

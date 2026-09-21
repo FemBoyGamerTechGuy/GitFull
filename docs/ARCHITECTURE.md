@@ -329,10 +329,18 @@ layers, in order:
 8. **ranked forge search — flagged fallback only.** Used when a name is
    in no layer above. Its result is **never silently auto-built**:
    candidates are printed flagged `UNCONFIRMED`, and proceeding
-   requires either an interactive TTY confirmation (`y`) or a
+   requires either an interactive confirmation (`y`) or a
    `[dep.<name>]` config pin (the sanctioned non-interactive path for
    scripts/CI/`--yes`-style runs — `--yes` deliberately does NOT
-   bypass this gate). Rationale: star/contributor/commit ranking
+   bypass this gate). "Interactive" means a real terminal on **both
+   ends of the prompt** — stdout (where the question is printed) and
+   stdin (where the answer is read), the classic `isatty(0) &&
+   isatty(1)` idiom. Anything else — piped/captured stdout, non-TTY
+   stdin, the inherited-but-unserviced terminal a packaging pipeline
+   or test runner leaves on fd 0 — is non-interactive and takes the
+   **hard-error path immediately: no prompt, no blocking stdin read
+   at all** (a blocking read there is an indefinite hang with the
+   question swallowed by output capture). Rationale: star/contributor/commit ranking
    answers *"what's a popular repo matching this text"*, which has no
    reliable correspondence to *"what is the correct upstream source for
    this pkg-config module"* — module names frequently are modules
@@ -483,6 +491,16 @@ fully-specified child env, audit-log append with secret redaction.
   ranked search against a local fake forge API (std-only HTTP server:
   all three forge kinds queried, enrichment via Link headers,
   resolution printed, `forge:name` scoping, no-match errors);
+  **TTY-state independence**: every test ctx pins
+  `interactive_override: Some(false)` (a simulated non-interactive
+  session), so prompt gates deterministically take their hard-error
+  path no matter which fds the test runner inherited — the suite
+  cannot hang on a confirmation prompt inside `makepkg check()`/CI,
+  where fd 0 is often still an inherited terminal nobody services;
+  the unconfirmed-search gate e2e additionally runs under a hard
+  60 s watchdog (worker thread + deadline), so a regression that
+  reintroduces a blocking stdin read fails loudly and fast instead of
+  hanging the packaging build;
 * privilege: root required for install/update/remove on system paths,
   both-paths-overridden dev mode allowed, read-only commands ungated;
 * packaging (tests/packaging.rs): distro recipes stay in sync — version

@@ -28,6 +28,7 @@ fn ctx(cfg: &Config) -> ExecCtx {
         extra_forbidden: Vec::new(),
         redactions: Vec::new(),
         resolve_path: cfg.host_tool_path.clone(),
+        interactive_override: None,
     }
 }
 
