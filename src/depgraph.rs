@@ -27,11 +27,13 @@
 //! dependency sets to prove the parsers are not tuned to one example.
 //!
 //! Resolution of a discovered name to a source happens in
-//! [`crate::planner`] through four generic layers (see
-//! docs/ARCHITECTURE.md): user `[dep.<name>]` config override → shared
-//! library cache (`<root>/libs/`, matched by the names the built
-//! library actually *provides*) → meson `.wrap` directives → ranked
-//! forge search over all configured forges.
+//! [`crate::planner`] through fixed layers (see docs/ARCHITECTURE.md):
+//! user `[dep.<name>]` config override → meson `.wrap` directives →
+//! vendored subprojects → shared library cache (`<root>/libs/`, matched
+//! by the names the built library actually *provides*) → the curated
+//! upstream map ([`crate::libmap`]: well-known pkg-config module names
+//! → their correct upstream repos) → ranked forge search as a FLAGGED
+//! fallback whose unconfirmed matches are never auto-built.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -1029,7 +1031,9 @@ fn scan_make(src: &Path) -> Result<DeclaredDeps> {
                 || tok.starts_with('-')
                 || !tok
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || matches!(c, '-' | '_' | '.' | '+'))
+                    // module names include digits (glib-2.0, gtk4,
+                    // sdl3, gee-0.8, ...) — letters+digits+separators
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
             {
                 continue; // flags, redirects — not module names
             }
@@ -1434,6 +1438,8 @@ AC_CHECK_LIB([z], [compress2])
             r#"PREFIX ?= /usr/local
 CFLAGS += $(shell pkg-config --cflags fake-zlib)
 LDLIBS += $(shell pkg-config --libs fake-zlib fake-utils)
+GLIB_CFLAGS = $(shell pkg-config --cflags fake-glib-2.0 fake-gio-unix-2.0)
+GLIB_LIBS = $(shell pkg-config --libs fake-gobject-2.0 fake-gtk4 sdl3 gee-0.8)
 # a comment: pkg-config --libs ignored-comment
 other:
         pkg-config --cflags something-else >/dev/null
@@ -1443,7 +1449,10 @@ other:
         let deps = scan(&d, BuildSystem::Make).unwrap();
         assert_eq!(
             names(&deps.required),
-            vec!["fake-utils", "fake-zlib", "something-else"]
+            vec![
+                "fake-gio-unix-2.0", "fake-glib-2.0", "fake-gobject-2.0", "fake-gtk4",
+                "fake-utils", "fake-zlib", "gee-0.8", "sdl3", "something-else"
+            ]
         );
         let _ = fs::remove_dir_all(&d);
     }

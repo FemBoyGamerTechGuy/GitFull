@@ -201,11 +201,30 @@ fn resolve_source(cfg: &Config, spec: &PkgSpec) -> Result<ResolvedSource> {
                     git_ref: spec.git_ref.clone(),
                 })
             }
-            None => Err(GitfullError::Unsupported(format!(
-                "URL `{u}` does not match any configured forge host. Add a \
-                 [forge.<name>] entry with that host to gitfull.conf — no code \
-                 changes needed (see docs/CONFIG.md)"
-            ))),
+            None => {
+                // A git URL on a host no [forge] entry covers. Cloning an
+                // anonymous https remote needs no forge machinery (search,
+                // ranking and tokens are all forge-side), so proceed as a
+                // generic source — with a visible hint that registering the
+                // host enables token/search handling for it. This is what
+                // lets curated-map entries (gitlab.gnome.org, …) and raw-URL
+                // [dep] pins work without extra configuration.
+                println!(
+                    "gitfull: note: URL `{u}` matches no configured forge host — \
+                     cloning it as an anonymous generic git remote (add a \
+                     [forge.<name>] entry with that host if you need tokens \
+                     or search for it)"
+                );
+                let (owner, repo) = parse_git_url_owner_repo(u)
+                    .unwrap_or_else(|| (String::new(), "repo".to_string()));
+                Ok(ResolvedSource::Git {
+                    forge_name: "generic".to_string(),
+                    owner,
+                    repo,
+                    url: authed_url(u, None),
+                    git_ref: spec.git_ref.clone(),
+                })
+            }
         },
         Source::Search { .. } => Err(GitfullError::Unsupported(
             "internal: a search spec reached the planner unprocessed — \
@@ -224,6 +243,30 @@ fn spec_owner(spec: &PkgSpec) -> String {
         Source::Forge { owner, .. } => owner.clone(),
         _ => String::new(),
     }
+}
+
+/// `(owner, repo)` from a git URL's path — `…/owner/repo(.git)` (owner
+/// may be a nested group: `…/group/sub/repo.git`). Generic (non-forge)
+/// URL sources use this for sandbox naming only.
+fn parse_git_url_owner_repo(url: &str) -> Option<(String, String)> {
+    let path = url.split("://").nth(1)?.splitn(2, '/').nth(1)?;
+    let mut segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    // drop a trailing empty fragment such as "…" or query strings
+    let last = segs.last_mut()?;
+    if let Some(stripped) = last.strip_suffix(".git") {
+        *last = stripped;
+    }
+    if segs.last()?.is_empty() {
+        segs.pop();
+    }
+    let repo = segs.pop()?.to_string();
+    if repo.is_empty() {
+        return None;
+    }
+    Some((segs.join("/"), repo))
 }
 
 fn spec_repo(spec: &PkgSpec) -> String {
@@ -607,6 +650,7 @@ impl Fetch {
 }
 
 /// What the walk should do with one queued dependency source.
+#[derive(Debug)]
 enum DepSpec {
     /// A concrete package spec (`[repo] packages`, `[dep.<name>] source`,
     /// or a name resolved through ranked forge search).
@@ -645,6 +689,7 @@ struct DepNode {
 }
 
 /// What planning one declared dependency concluded.
+#[derive(Debug)]
 enum DepPlan {
     /// Nothing to fetch (reason printed for the user).
     Satisfied,
@@ -652,18 +697,33 @@ enum DepPlan {
     CacheHit(PathBuf),
     /// Fetch + build from this source.
     Fetch(DepSpec),
+    /// Only ranked-search candidates exist — **unconfirmed**. Never
+    /// auto-built: the walk must either collect an interactive
+    /// confirmation (TTY) or fail with a pin hint; `--dry-run` reports
+    /// it as unresolved and skips the subtree.
+    Unconfirmed(Vec<search::Candidate>),
 }
 
-/// Plan one manifest-declared dependency through the resolution layers:
+/// Plan one manifest-declared dependency through the resolution layers
+/// (highest authority first):
 ///
 /// 1. cargo registry deps — the cargo resolver fetches them into the
 ///    app's own sandbox at build time (isolation-compliant by design);
-/// 2. user `[dep.<name>]` override (`skip`, or a pinned `source`);
+/// 2. user `[dep.<name>]` override (`skip`, or a pinned `source`) —
+///    user configuration always wins, including over the curated map;
 /// 3. meson wraps (the manifest's own pin files — git/file);
 /// 4. vendored subprojects (checked-in trees under `subprojects/`);
 /// 5. the shared library cache, matched by provided names;
-/// 6. ranked forge search over all configured forges (the generic
-///    name→repo mapping — no name tables anywhere in the code).
+/// 6. the **curated upstream map** ([`crate::libmap`]) — well-known
+///    pkg-config module names → their correct upstream repository.
+///    This is the sound resolution strategy for module names: a
+///    module→upstream mapping is *knowledge*, not something
+///    star-ranking can infer (module names often live inside a parent
+///    library's repo — `gio-unix-2.0` is a GLib module; generic names
+///    string-match unrelated projects);
+/// 7. ranked forge search — **flagged fallback only**: candidates are
+///    returned unconfirmed ([`DepPlan::Unconfirmed`]) and must never be
+///    silently auto-built.
 fn plan_declared_dep(
     cfg: &Config,
     ctx: &ExecCtx,
@@ -744,9 +804,32 @@ fn plan_declared_dep(
         );
         return Ok(DepPlan::CacheHit(dir));
     }
-    // generic resolution: ranked forge search across all configured forges
-    let spec = search::resolve_dep_name(cfg, ctx, &d.name)?;
-    Ok(DepPlan::Fetch(DepSpec::Package(spec)))
+    // curated upstream map: the sound strategy for module names — a
+    // well-known module's correct upstream is knowledge, not something
+    // popularity ranking can infer. Extensible/overridable via [dep].
+    if let Some(entry) = crate::libmap::lookup(&d.name_norm) {
+        let mut spec = PkgSpec::parse(entry.source)?;
+        if spec.git_ref.is_none() {
+            spec.git_ref = entry.git_ref.map(|s| s.to_string());
+        }
+        println!(
+            "gitfull: dep `{}`: curated upstream map -> {}{} ({}) — well-known \
+             module; sibling module names mapping to this same source \
+             deduplicate to one fetch/build",
+            d.name,
+            entry.source,
+            entry
+                .git_ref
+                .map(|r| format!(" (ref {r})"))
+                .unwrap_or_default(),
+            entry.label
+        );
+        return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
+    }
+    // ranked forge search: FLAGGED FALLBACK — candidates only, never an
+    // auto-selected build (see DepPlan::Unconfirmed)
+    let candidates = search::rank_dep_candidates(cfg, ctx, &d.name)?;
+    Ok(DepPlan::Unconfirmed(candidates))
 }
 
 /// Resolve a *pinned* dependency source (user `[dep.<name>]` override or
@@ -1022,6 +1105,89 @@ fn plan_dep_fetch(cfg: &Config, spec: &DepSpec) -> Result<PlannedFetch> {
     }
 }
 
+/// Confirm (or refuse) an **unconfirmed** ranked-search candidate for
+/// a dependency name. This is the gate that makes the search fallback
+/// safe: no search result is ever built without either
+///
+/// * an explicit interactive confirmation (TTY `y`), or
+/// * a `[dep.<name>]` pin in gitfull.conf (the non-interactive path —
+///   which is also what `--dry-run`/scripts/CI should use).
+///
+/// `--yes` deliberately does NOT bypass this gate: it suppresses
+/// *prompts*, not the missing confirmation itself.
+///
+/// `tty` and `read_line` are parameters so tests can drive both sides
+/// without a real terminal.
+fn confirm_unconfirmed_search_dep(
+    name: &str,
+    cands: &[search::Candidate],
+    tty: bool,
+    read_line: &dyn Fn() -> Option<String>,
+) -> Result<PkgSpec> {
+    let top = &cands[0];
+    let stars = if top.stars >= 10.0 {
+        format!("{} stars", top.stars as u64)
+    } else {
+        format!(
+            "{} stars — NEAR-ZERO signal, likely a wrong repo",
+            top.stars as u64
+        )
+    };
+    let pin_hint = format!(
+        "pin the correct source in gitfull.conf:\n    \
+         [dep.\"{name}\"]\n    source = \"forge:owner/repo\"   # or any git URL"
+    );
+    if !tty {
+        return Err(GitfullError::Unsupported(format!(
+            "dep `{name}` has NO curated mapping, [dep] pin, wrap or cached \
+             build — only ranked-search candidates exist, and the top one \
+             ({}:{} — {stars}) is UNCONFIRMED: popularity ranking cannot \
+             establish upstream identity for a library module name. Refusing \
+             to auto-build an unconfirmed match. Either {pin_hint} or run \
+             interactively on a TTY to confirm once",
+            top.forge,
+            top.full_name()
+        )));
+    }
+    print!(
+        "gitfull: dep `{name}`: build the UNCONFIRMED search match {}:{} \
+         (rank 1 of {}, {stars})? [y/N] ",
+        top.forge,
+        top.full_name(),
+        cands.len()
+    );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    match read_line() {
+        Some(line) if line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes") => {
+            println!(
+                "gitfull: confirmed — for reproducible installs, also pin it: \
+                 [dep.\"{name}\"] source = \"{}:{}\"",
+                top.forge,
+                top.full_name()
+            );
+            Ok(PkgSpec {
+                source: Source::Forge {
+                    forge: Some(top.forge.clone()),
+                    owner: top.owner.clone(),
+                    repo: top.repo.clone(),
+                },
+                git_ref: None,
+            })
+        }
+        _ => Err(GitfullError::Unsupported(format!(
+            "aborted at unconfirmed dependency `{name}` — {pin_hint}"
+        ))),
+    }
+}
+
+/// Read one line from the real stdin (the interactive confirmation
+/// path; tests inject their own closure instead).
+fn read_stdin_line() -> Option<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok().map(|_| line)
+}
+
 /// Plan every declared dependency of one scanned tree: adds fetches to
 /// the walk queue, returns shared-cache hits as `(name, dir)` pairs.
 ///
@@ -1030,6 +1196,10 @@ fn plan_dep_fetch(cfg: &Config, spec: &DepSpec) -> Result<PlannedFetch> {
 /// project's own pin, and honoring it can only over-provide, never
 /// under-provide. (Vendored in-tree subprojects are excluded here — they
 /// need no fetch.)
+///
+/// `dry_run` only changes how an **unconfirmed** search fallback is
+/// handled: a real install must confirm (TTY) or fail (pin hint), while
+/// a dry run reports the dep as unresolved and skips its subtree.
 fn plan_scan(
     cfg: &Config,
     ctx: &ExecCtx,
@@ -1037,6 +1207,7 @@ fn plan_scan(
     scan: &depgraph::DeclaredDeps,
     parent: usize,
     queue: &mut VecDeque<QueuedDep>,
+    dry_run: bool,
 ) -> Result<Vec<(String, PathBuf)>> {
     let mut hits = Vec::new();
     for d in scan
@@ -1076,6 +1247,31 @@ fn plan_scan(
                 name_norm: Some(d.name_norm.clone()),
                 cache_name: d.name_norm.clone(),
             }),
+            DepPlan::Unconfirmed(cands) => {
+                if dry_run {
+                    println!(
+                        "gitfull: dep `{}`: UNRESOLVED — only unconfirmed search \
+                         candidates exist; a real install stops here for a \
+                         [dep] pin or an interactive confirmation. Nothing \
+                         would be auto-built.",
+                        d.name
+                    );
+                } else {
+                    let spec = confirm_unconfirmed_search_dep(
+                        &d.name,
+                        &cands,
+                        util::is_tty(0),
+                        &read_stdin_line,
+                    )?;
+                    queue.push_back(QueuedDep {
+                        spec: DepSpec::Package(spec),
+                        parent,
+                        declared: Some(d.name.clone()),
+                        name_norm: Some(d.name_norm.clone()),
+                        cache_name: d.name_norm.clone(),
+                    });
+                }
+            }
         }
     }
     for w in &scan.wraps {
@@ -1282,7 +1478,7 @@ pub fn install(
             cache_name: spec_repo(p),
         })
         .collect();
-    let app_hits = plan_scan(cfg, &fetch_ctx, &libcache, &declared, 0, &mut queue)?;
+    let app_hits = plan_scan(cfg, &fetch_ctx, &libcache, &declared, 0, &mut queue, opts.dry_run)?;
     nodes[0].lib_hits = app_hits.iter().map(|(_, d)| d.clone()).collect();
 
     while let Some(q) = queue.pop_front() {
@@ -1339,7 +1535,7 @@ pub fn install(
         // is transitive — same generic parsers, same resolution layers)
         let dep_scan = depgraph::scan(&depsb.src(), dep_resolved.build)?;
         let node_idx = nodes.len();
-        let dep_hits = plan_scan(cfg, &fetch_ctx, &libcache, &dep_scan, node_idx, &mut queue)?;
+        let dep_hits = plan_scan(cfg, &fetch_ctx, &libcache, &dep_scan, node_idx, &mut queue, opts.dry_run)?;
         for p in &dep_resolved.packages {
             queue.push_back(QueuedDep {
                 spec: DepSpec::Package(p.clone()),
@@ -1998,4 +2194,214 @@ pub fn info(cfg: &Config, query: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// tests: resolution-layer ordering + the unconfirmed-search gate
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gitproc::ExecCtx;
+
+    /// A config with fake-invalid forges (search is unreachable —
+    /// exactly the setup that must NEVER leak into an auto-build) and
+    /// an optional extra TOML stanza.
+    fn test_cfg(extra: Option<&str>) -> Config {
+        let dir = std::env::temp_dir().join(format!(
+            "gitfull-planner-test-{}-{}",
+            std::process::id(),
+            util::epoch()
+        ));
+        std::fs::create_dir_all(dir.join("root")).unwrap();
+        let mut conf = format!(
+            "[core]\nroot = \"{}\"\nbin_dir = \"{}\"\n\n\
+             [forge.github]\nkind = \"github\"\nhost = \"fake.invalid\"\napi_base = \"https://fake.invalid\"\n\n\
+             [forge.gitlab]\nkind = \"gitlab\"\nhost = \"fake.invalid\"\n\n\
+             [forge.codeberg]\nkind = \"forgejo\"\nhost = \"fake.invalid\"\n",
+            dir.join("root").display(),
+            dir.join("bin").display()
+        );
+        if let Some(x) = extra {
+            conf.push_str(x);
+        }
+        let path = dir.join("gitfull.conf");
+        std::fs::write(&path, conf).unwrap();
+        let (cfg, warns) = Config::load(&path).unwrap();
+        assert!(warns.is_empty(), "{warns:?}");
+        cfg
+    }
+
+    fn ctx(cfg: &Config) -> ExecCtx {
+        ExecCtx {
+            audit_log: Some(cfg.root.join("audit.log")),
+            extra_forbidden: Vec::new(),
+            redactions: Vec::new(),
+            resolve_path: cfg.host_tool_path.clone(),
+        }
+    }
+
+    fn dep(name: &str) -> DeclaredDep {
+        DeclaredDep {
+            name: name.to_string(),
+            name_norm: name.to_ascii_lowercase(),
+            kind: crate::depgraph::DepKind::PkgConfig,
+            required: true,
+            version: None,
+            origin: "test".to_string(),
+            git_url: None,
+        }
+    }
+
+    fn empty_cache(cfg: &Config) -> LibCache {
+        LibCache::new(cfg.libs_dir.clone())
+    }
+
+    /// The strategy change, distilled: a well-known module name resolves
+    /// through the CURATED MAP, never through search. This also proves
+    /// the map is consulted without touching the network (the fake
+    /// forges are unreachable; a search would fail the test).
+    #[test]
+    fn curated_map_beats_search_for_well_known_modules() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        for (name, expect_url) in [
+            ("glib-2.0", "https://gitlab.gnome.org/GNOME/glib"),
+            ("gio-unix-2.0", "https://gitlab.gnome.org/GNOME/glib"),
+            ("cairo", "https://gitlab.freedesktop.org/cairo/cairo"),
+            ("gee-0.8", "https://gitlab.gnome.org/GNOME/libgee"),
+            ("sdl3", "https://github.com/libsdl-org/SDL"),
+        ] {
+            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name)).unwrap() {
+                DepPlan::Fetch(DepSpec::Package(p)) => {
+                    assert_eq!(
+                        p.key(),
+                        expect_url,
+                        "`{name}` must resolve through the curated map"
+                    );
+                }
+                other => panic!("`{name}`: expected a curated Fetch, got {other:?}"),
+            }
+        }
+    }
+
+    /// Curated entries with maintenance refs keep them (sdl2 means the
+    /// SDL repo's SDL2 branch, not the default SDL3 branch).
+    #[test]
+    fn curated_refs_are_carried_into_the_spec() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("sdl2")).unwrap() {
+            DepPlan::Fetch(DepSpec::Package(p)) => {
+                assert_eq!(p.key(), "https://github.com/libsdl-org/SDL");
+                assert_eq!(p.git_ref.as_deref(), Some("SDL2"));
+            }
+            other => panic!("sdl2: expected Fetch, got {other:?}"),
+        }
+    }
+
+    /// A user `[dep.<name>]` pin overrides the curated map — extension
+    /// and override happen in config, never in code.
+    #[test]
+    fn user_dep_pin_overrides_the_curated_map() {
+        let extra = "\n[dep.cairo]\nsource = \"github:myorg/my-cairo-fork\"\nref = \"stable\"\n";
+        let cfg = test_cfg(Some(extra));
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("cairo")).unwrap() {
+            DepPlan::Fetch(DepSpec::Package(p)) => {
+                assert_eq!(p.key(), "myorg/my-cairo-fork");
+                assert_eq!(p.git_ref.as_deref(), Some("stable"));
+            }
+            other => panic!("cairo: expected the user pin, got {other:?}"),
+        }
+    }
+
+    /// Multiple modules of one parent (glib-2.0 + gio-unix-2.0) plan to
+    /// the SAME fetch identity — the precondition for the walk's
+    /// single-fetch/build deduplication.
+    #[test]
+    fn same_parent_modules_plan_to_one_identity() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        let mut identities = BTreeSet::new();
+        for name in ["glib-2.0", "gio-unix-2.0", "gobject-2.0", "gio-2.0"] {
+            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name)).unwrap() {
+                DepPlan::Fetch(DepSpec::Package(p)) => {
+                    let planned = plan_dep_fetch(&cfg, &DepSpec::Package(p)).unwrap();
+                    identities.insert(planned.identity);
+                }
+                other => panic!("`{name}`: expected Fetch, got {other:?}"),
+            }
+        }
+        assert_eq!(identities.len(), 1, "{identities:?}");
+    }
+
+    /// The gate itself: a non-TTY context may NEVER build a search
+    /// fallback match, however highly ranked it is.
+    #[test]
+    fn unconfirmed_search_never_builds_without_confirmation() {
+        let cands = vec![search::Candidate {
+            forge: "github".into(),
+            owner: "someone".into(),
+            repo: "coursework-gee".into(),
+            stars: 2.0,
+            contributors: Some(1.0),
+            commits: Some(3.0),
+            last_activity: Some(util::epoch() - 90 * 86400),
+            score: 0.12,
+        }];
+        // non-TTY: hard error naming the dep, the unconfirmed match and
+        // the [dep] pin syntax — nothing about "auto-selected"
+        let err = confirm_unconfirmed_search_dep("gee-0.8", &cands, false, &|| None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("gee-0.8"), "{msg}");
+        assert!(msg.contains("UNCONFIRMED"), "{msg}");
+        assert!(msg.contains("[dep."), "{msg}");
+        assert!(!msg.contains("auto-selected"), "{msg}");
+        // TTY + "n"/EOF: refused
+        let refused = confirm_unconfirmed_search_dep("gee-0.8", &cands, true, &|| None).unwrap_err();
+        assert!(format!("{refused}").contains("aborted"));
+        // TTY + "y": proceeds with the TOP candidate only
+        let ok = confirm_unconfirmed_search_dep("gee-0.8", &cands, true, &|| Some("y\n".into()))
+            .unwrap();
+        assert_eq!(ok.key(), "someone/coursework-gee");
+        // even a 796-star match is unconfirmed without consent
+        let popular = vec![search::Candidate {
+            forge: "github".into(),
+            owner: "TryGhost".into(),
+            repo: "docker-library-ghost".into(),
+            stars: 796.0,
+            contributors: Some(40.0),
+            commits: Some(500.0),
+            last_activity: Some(util::epoch() - 86400),
+            score: 0.58,
+        }];
+        assert!(confirm_unconfirmed_search_dep("cairo", &popular, false, &|| None).is_err());
+    }
+
+    /// Generic (non-forge) git URLs plan to a plain anonymous fetch —
+    /// no forge registration required, owner/repo parsed for the
+    /// sandbox name only.
+    #[test]
+    fn generic_git_urls_parse_owner_repo() {
+        assert_eq!(
+            parse_git_url_owner_repo("https://gitlab.gnome.org/GNOME/glib"),
+            Some(("GNOME".to_string(), "glib".to_string()))
+        );
+        assert_eq!(
+            parse_git_url_owner_repo("https://gitlab.freedesktop.org/cairo/cairo.git"),
+            Some(("cairo".to_string(), "cairo".to_string()))
+        );
+        assert_eq!(
+            parse_git_url_owner_repo("https://gitlab.com/group/sub/libtiff.git"),
+            Some(("group/sub".to_string(), "libtiff".to_string()))
+        );
+        assert_eq!(parse_git_url_owner_repo("https://example.com"), None);
+    }
 }

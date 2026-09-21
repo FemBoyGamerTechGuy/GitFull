@@ -115,13 +115,23 @@ packages = ["acme/libfoundation"]
 # ----------------------------------------------------------------------------
 # Keyed by the name a build manifest declares (meson dependency('name'),
 # cmake find_package(Name), autotools AC_CHECK_LIB([name]), a Makefile
-# pkg-config module). WITHOUT an override, names discovered from manifests
-# resolve generically: shared library cache -> meson wraps -> ranked forge
-# search. These entries are user pins, not code-side name tables.
+# pkg-config module). Resolution order (highest authority first):
+#   1. this section — an entry here always wins
+#   2. meson wraps / vendored subprojects
+#   3. the shared library cache (<root>/libs/)
+#   4. gitfull's built-in CURATED UPSTREAM MAP of well-known pkg-config
+#      module names (GLib/GTK families, cairo, pango, harfbuzz, SDL,
+#      wayland, ...) — overridable only through this section
+#   5. ranked forge search — flagged fallback: its matches are UNCONFIRMED
+#      and are never auto-built (interactive `y` confirmation or a pin
+#      here is required; `--yes` does not bypass this).
 [dep."zlib"]
 # Pin a dependency to a specific source (any spec form) + ref:
-# source = "gitlab:madler/zlib"
+# source = "github:madler/zlib"
 # ref    = "develop"
+# A URL on an unregistered host (gitlab.gnome.org, ...) also works — it
+# is cloned as an anonymous generic git remote:
+# source = "https://gitlab.gnome.org/GNOME/libgee"
 # Or deliberately never provision a declared dependency:
 # skip   = true
 

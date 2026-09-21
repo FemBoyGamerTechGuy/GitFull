@@ -147,12 +147,52 @@ skip = false                     # never provision this dependency
 | `ref` | string | pin a branch/tag/commit; requires `source` |
 | `skip` | bool | deliberate opt-out: never provision this dependency (e.g. a project declares a dependency it does not actually need) |
 
-Without an override, dependency names discovered from manifests resolve
-through generic layers only — shared library cache, meson wraps, then
-ranked forge search (see docs/ARCHITECTURE.md, "Dependency-graph
-discovery"). These overrides are *user configuration*, mirroring
-`[toolchain.sources]`; gitfull itself contains no per-repo or
-per-library name tables.
+### How `[dep]` composes with curated-mapping-first resolution
+
+Dependency names discovered from build manifests resolve through fixed
+layers, highest authority first (see docs/ARCHITECTURE.md, "Resolution
+layers"):
+
+1. `[dep.<name>]` — **this section always wins**;
+2. meson wraps, vendored subprojects;
+3. the shared library cache (`<root>/libs/`);
+4. the **curated upstream map** — gitfull's built-in table of
+   well-known pkg-config module names → their correct upstream
+   repositories (GLib family, GTK family, cairo, pango, harfbuzz,
+   freetype, libsoup, json-glib, libadwaita, libgee, libnotify,
+   appstream, libarchive, SDL, wayland, … seeded with common
+   windowing/graphics/core-library modules);
+5. ranked forge search — **flagged fallback only**.
+
+So `[dep.<name>]` is simultaneously the *override* and the *extension*
+mechanism for the curated map: an entry here beats the built-in table
+(use it to redirect a module at your fork or a mirror), and a name the
+table does not seed gets pinned here the same way.
+
+`source` accepts any spec form — `forge:owner/repo`, `owner/repo`, a
+git URL, or a local path. URLs on hosts not registered as forges
+(e.g. `https://gitlab.gnome.org/GNOME/libgee`) are cloned as anonymous
+generic git remotes, so pinning an upstream that is not a configured
+forge needs no extra configuration.
+
+### The search fallback never auto-builds
+
+When a name is in neither `[dep]`, the curated map, a wrap, nor the
+cache, ranked forge search runs — but its result is **unconfirmed**:
+popularity ranking cannot establish upstream identity for a library
+module name. gitfull prints the ranked candidates flagged UNCONFIRMED
+and proceeds only if
+
+* the invocation is interactive (TTY) and you confirm the top match
+  with `y` (gitfull then prints the exact `[dep]` pin to make the
+  choice reproducible), or
+* you pin the name in gitfull.conf (the path for scripts, CI and
+  `--dry-run`-style automation; `--yes` deliberately does NOT bypass
+  this gate).
+
+Non-interactive invocations without a pin fail with the candidate
+table and the pin syntax — never a silent build of a rank-1 match,
+however many stars it has.
 
 ## 5. `[paths]` — directory overrides
 

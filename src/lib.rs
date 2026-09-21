@@ -42,6 +42,7 @@ pub mod forge;
 pub mod gitproc;
 pub mod json;
 pub mod libcache;
+pub mod libmap;
 pub mod manifest;
 pub mod planner;
 pub mod privilege;

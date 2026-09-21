@@ -521,15 +521,22 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
     })
 }
 
-/// Resolve ONE dependency name (parsed out of a build manifest by
-/// [`crate::depgraph`]) to a concrete `forge:owner/repo` spec — the same
-/// ranked-search mechanism as [`resolve`], with compact output suitable
-/// for the many resolutions an install may perform.
+/// Rank forge-search candidates for ONE dependency name (parsed out of
+/// a build manifest by [`crate::depgraph`]). Returns the ranked list —
+/// **without committing to any of them.**
 ///
-/// Like `resolve`, this is fully generic: the name→repo mapping comes
-/// from the configured forges' search APIs and the ranking, never from
-/// a table in the code.
-pub fn resolve_dep_name(cfg: &Config, ctx: &ExecCtx, name: &str) -> Result<PkgSpec> {
+/// This is the *flagged fallback* of dependency-name resolution, used
+/// only when the name is in neither the user's `[dep.<name>]` config,
+/// the curated upstream map ([`crate::libmap`]), meson wraps, nor the
+/// shared library cache. Star/contributor/commit ranking answers "what
+/// is a popular repo matching this text" — it has **no reliable
+/// correspondence** to "what is the correct upstream source for this
+/// pkg-config module" (module names often live inside a parent
+/// library's repository; generic names string-match unrelated
+/// projects). The caller must therefore treat every candidate as
+/// **unconfirmed** and require an interactive confirmation or a config
+/// pin before building anything (see `planner::confirm_unconfirmed_…`).
+pub fn rank_dep_candidates(cfg: &Config, ctx: &ExecCtx, name: &str) -> Result<Vec<Candidate>> {
     let forges: Vec<&Forge> = cfg.forges.all().collect();
     let (mut candidates, searchable, failed) = gather_candidates(cfg, ctx, &forges, name);
 
@@ -543,30 +550,45 @@ pub fn resolve_dep_name(cfg: &Config, ctx: &ExecCtx, name: &str) -> Result<PkgSp
     }
 
     enrich_and_rank(cfg, ctx, &mut candidates);
-    let top = &candidates[0];
+    print_unconfirmed(name, &candidates);
+    Ok(candidates)
+}
+
+/// Print a dependency-name candidate table with the unconfirmed flag —
+/// deliberately nothing like `print_resolution`'s "auto-selected" line,
+/// because NONE of these candidates may be auto-built.
+pub fn print_unconfirmed(name: &str, candidates: &[Candidate]) {
     println!(
-        "gitfull: dep `{name}` resolved to {}:{} (rank 1 of {}; score {:.2}; {})",
-        top.forge,
-        top.full_name(),
-        candidates.len(),
-        top.score,
-        match (top.stars, top.last_activity) {
-            (s, Some(ts)) => format!(
-                "{} stars, last active {}",
-                format_count(s),
-                format_age(ts, util::epoch())
-            ),
-            (s, None) => format!("{} stars", format_count(s)),
-        }
+        "gitfull: dep `{name}` is NOT covered by the curated upstream map, \
+         nor a [dep] pin — ranked forge search found {} candidate(s), ALL \
+         UNCONFIRMED (popularity cannot establish upstream identity for a \
+         library module name):",
+        candidates.len()
     );
-    Ok(PkgSpec {
-        source: Source::Forge {
-            forge: Some(top.forge.clone()),
-            owner: top.owner.clone(),
-            repo: top.repo.clone(),
-        },
-        git_ref: None,
-    })
+    let now = util::epoch();
+    for (i, c) in candidates.iter().enumerate() {
+        let age = c
+            .last_activity
+            .map(|t| format_age(t, now))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {:<4} {}:{}  ({} stars, last active {})  <- unconfirmed",
+            i + 1,
+            c.forge,
+            c.full_name(),
+            format_count(c.stars),
+            age
+        );
+    }
+    if let Some(top) = candidates.first() {
+        if top.stars < 10.0 {
+            println!(
+                "gitfull: WARNING: the top match has near-zero stars — \
+                 particularly low signal; treat it as a wrong-repo match \
+                 until proven otherwise"
+            );
+        }
+    }
 }
 
 /// Query every forge for `term`. Returns (candidates, searchable forge

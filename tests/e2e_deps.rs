@@ -677,7 +677,7 @@ fn copy_dir(src: &Path, dest: &Path) {
 }
 
 #[test]
-fn search_resolves_dep_name_then_clones_builds_and_links() {
+fn search_fallback_is_flagged_unconfirmed_and_requires_a_pin() {
     if !tools_ready() {
         eprintln!("skipping deps e2e search: tools not present");
         return;
@@ -700,16 +700,18 @@ fn search_resolves_dep_name_then_clones_builds_and_links() {
     let server = FakeForgeServer::start(stage.join("docroot"));
 
     // fixture with a github-kind forge pointed at the fake server — NO
-    // [dep] overrides: the dependency name must resolve through search
-    let extra = format!(
+    // [dep] overrides and `fake-zlib` is NOT in the curated map, so the
+    // only resolution layer left is ranked search… whose result must be
+    // REFUSED as unconfirmed (tests run non-interactively: no TTY)
+    let forge_conf = format!(
         "\n[forge.github]\nkind = \"github\"\nhost = \"127.0.0.1\"\napi_base = \"{api}\"\nclone_template = \"{api}/{{owner}}/{{repo}}.git\"\n\n\
          [forge.gitlab]\nkind = \"gitlab\"\nhost = \"fake.invalid\"\n\n\
          [forge.codeberg]\nkind = \"forgejo\"\nhost = \"fake.invalid\"\n",
         api = server.addr
     );
-    let fx = Fixture::with_conf("searchfx", Some(extra));
+    let fx = Fixture::with_conf("searchfx-a", Some(forge_conf.clone()));
     write_app_repo(
-        &fx.root.join("src-app4"),
+        &fx.root.join("src-app-a"),
         "searchhello",
         &["fake-zlib"],
         r#"#include <stdio.h>
@@ -722,24 +724,72 @@ int main(void) {
     );
     let cfg = fx.cfg();
     let ctx = fx.ctx(&cfg);
-    let spec = PkgSpec::parse(&fx.root.join("src-app4").display().to_string()).unwrap();
+    let spec = PkgSpec::parse(&fx.root.join("src-app-a").display().to_string()).unwrap();
 
-    let rec = planner::install(&cfg, &ctx, &spec, &Fixture::opts())
-        .unwrap()
-        .expect("search-resolved install should succeed");
-
-    // the search API was actually used for the dep name
+    // ---- phase A: unconfirmed search match → REFUSED, nothing built ----
+    let err = match planner::install(&cfg, &ctx, &spec, &Fixture::opts()) {
+        Ok(_) => panic!("an unconfirmed search match must never auto-build"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("fake-zlib"), "{msg}");
+    assert!(msg.contains("UNCONFIRMED"), "{msg}");
+    assert!(msg.contains("[dep."), "must point at the pin syntax: {msg}");
+    assert!(msg.contains("octocat/fake-zlib"), "must name the refused candidate: {msg}");
+    // the search API WAS queried and produced the 142-star candidate —
+    // and it was still refused (star-ranking cannot establish upstream
+    // identity for a module name)
     assert!(server.hit_count("/search/repositories") >= 1);
-    assert!(server.hit_count("/octocat/fake-zlib.git/info/refs") >= 1);
+    // nothing was provisioned: no dep sandboxes, no cache, no binaries
+    assert!(libs_entries(&cfg).is_empty(), "no cache entry from a refusal");
+    assert_eq!(fs::read_dir(fx.root.join("bin")).unwrap().flatten().count(), 0);
+    let deps_dir = cfg.apps_dir.join("src-app-a").join("deps");
+    let dep_subdirs: Vec<_> = match fs::read_dir(&deps_dir) {
+        Ok(rd) => rd.flatten().filter(|e| e.path().is_dir()).collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(
+        dep_subdirs.is_empty(),
+        "no dependency may be cloned from an unconfirmed match: {deps_dir:?}"
+    );
+
+    // ---- phase B: the SAME setup, plus a [dep] pin → proceeds ---------
+    // (the pin composes with curated-mapping-first resolution: an
+    // explicit user pin is exactly the sanctioned confirmation path)
+    let fx2 = Fixture::with_conf(
+        "searchfx-b",
+        Some(format!(
+            "{forge_conf}\n[dep.fake-zlib]\nsource = \"github:octocat/fake-zlib\"\n"
+        )),
+    );
+    write_app_repo(
+        &fx2.root.join("src-app-b"),
+        "searchhello",
+        &["fake-zlib"],
+        r#"#include <stdio.h>
+#include "fake_zlib.h"
+int main(void) {
+    printf("s=%d\n", fake_zlib_entry(4));
+    return 0;
+}
+"#,
+    );
+    let cfg2 = fx2.cfg();
+    let ctx2 = fx2.ctx(&cfg2);
+    let spec2 = PkgSpec::parse(&fx2.root.join("src-app-b").display().to_string()).unwrap();
+
+    let rec = planner::install(&cfg2, &ctx2, &spec2, &Fixture::opts())
+        .unwrap()
+        .expect("a pinned dep must install without any confirmation");
 
     // the dep was cloned from the fake forge and cached
     assert_eq!(rec.packages.len(), 1, "{:?}", rec.packages);
     assert!(rec.packages[0].contains("octocat/fake-zlib"), "{:?}", rec.packages);
-    let entries = libs_entries(&cfg);
+    let entries = libs_entries(&cfg2);
     assert_eq!(entries.len(), 1, "{entries:?}");
 
-    // and the app really links the searched-and-built library
-    let bin = fx.root.join("bin/searchhello");
+    // and the app really links the pinned, searched-forge-built library
+    let bin = fx2.root.join("bin/searchhello");
     let out = Command::new(&bin).output().unwrap();
     assert!(out.status.success());
     // fake_zlib_entry(4) = 4 * 11
@@ -747,7 +797,7 @@ int main(void) {
 
     // clone progress: the dep fetch ran through the shared progress-UI
     // code path (same git_clone entry point as the main repo)
-    let audit = fs::read_to_string(cfg.root.join("audit.log")).unwrap();
+    let audit = fs::read_to_string(cfg2.root.join("audit.log")).unwrap();
     assert!(
         audit.contains("fetch-tool\t/usr/bin/git\t"),
         "dep clone through the shared git_clone entry point: {audit:?}"
@@ -755,6 +805,149 @@ int main(void) {
     assert!(audit.contains("octocat/fake-zlib"), "{audit}");
 
     let _ = fs::remove_dir_all(&stage);
+}
+
+// ---------------------------------------------------------------------------
+// same-parent modules (gio-*/glib-* style): ONE source, ONE build
+// ---------------------------------------------------------------------------
+
+/// A multi-module library source, mirroring how GLib is ONE repository
+/// providing glib-2.0 / gio-unix-2.0 / gobject-2.0: one static lib, one
+/// header, THREE pkg-config module files.
+fn write_parent_lib_repo(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("Makefile"),
+        "PREFIX ?= /usr/local\n\n\
+         libfake-glib.a: fake_glib.o\n\
+         \tar rcs libfake-glib.a fake_glib.o\n\n\
+         fake_glib.o: fake_glib.c fake_glib.h\n\
+         \t$(CC) $(CFLAGS) -c fake_glib.c\n\n\
+         install: libfake-glib.a\n\
+         \tmkdir -p $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include\n\
+         \tcp libfake-glib.a $(DESTDIR)$(PREFIX)/lib\n\
+         \tcp fake_glib.h $(DESTDIR)$(PREFIX)/include\n\
+         \tsed -e 's|@PREFIX@|$(PREFIX)|g' fake-glib-2.0.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/fake-glib-2.0.pc\n\
+         \tsed -e 's|@PREFIX@|$(PREFIX)|g' fake-gio-unix-2.0.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/fake-gio-unix-2.0.pc\n\
+         \tsed -e 's|@PREFIX@|$(PREFIX)|g' fake-gobject-2.0.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/fake-gobject-2.0.pc\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("fake_glib.c"),
+        "#include \"fake_glib.h\"\nint fake_glib_entry(int n) { return n * 7; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("fake_glib.h"),
+        "#ifndef FAKE_GLIB_H\n#define FAKE_GLIB_H\nint fake_glib_entry(int n);\n#endif\n",
+    )
+    .unwrap();
+    for module in ["fake-glib-2.0", "fake-gio-unix-2.0", "fake-gobject-2.0"] {
+        fs::write(
+            dir.join(format!("{module}.pc.in")),
+            format!(
+                "prefix=${{pcfiledir}}/../..\n\
+                 libdir=${{prefix}}/lib\n\
+                 includedir=${{prefix}}/include\n\n\
+                 Name: {module}\n\
+                 Description: one parent library, many module names\n\
+                 Version: 1.0.0\n\
+                 Libs: -L${{libdir}} -lfake-glib\n\
+                 Cflags: -I${{includedir}}\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn same_parent_modules_deduplicate_to_one_fetch_and_build() {
+    if !tools_ready() {
+        eprintln!("skipping deps e2e dedup: tools not present");
+        return;
+    }
+    // the gio-*/glib-* scenario, distilled: the app declares THREE
+    // module names; all three pin to (resolve to) the SAME parent
+    // source; the identity dedup must fetch and build it ONCE
+    let fx = Fixture::new("dedup");
+    let parent = fx.root.join("src-fakeglib");
+    write_parent_lib_repo(&parent);
+
+    // the app declares all three module names in ONE pkg-config line —
+    // exactly how a GLib consumer looks
+    write_app_repo(
+        &fx.root.join("src-app"),
+        "deduphello",
+        &["fake-glib-2.0", "fake-gio-unix-2.0", "fake-gobject-2.0"],
+        r#"#include <stdio.h>
+#include "fake_glib.h"
+int main(void) {
+    printf("g=%d\n", fake_glib_entry(6));
+    return 0;
+}
+"#,
+    );
+    // pin every module name to the SAME parent source (in production
+    // the curated map does this mapping; the pins here exercise the
+    // identical identity-dedup path offline)
+    let mut conf = fs::read_to_string(fx.root.join("gitfull.conf")).unwrap();
+    for module in ["fake-glib-2.0", "fake-gio-unix-2.0", "fake-gobject-2.0"] {
+        conf.push_str(&format!(
+            "\n[dep.\"{module}\"]\nsource = \"{}\"\n",
+            parent.display()
+        ));
+    }
+    fs::write(fx.root.join("gitfull.conf"), conf).unwrap();
+
+    let cfg = fx.cfg();
+    let ctx = fx.ctx(&cfg);
+    let spec = PkgSpec::parse(&fx.root.join("src-app").display().to_string()).unwrap();
+    let rec = planner::install(&cfg, &ctx, &spec, &Fixture::opts())
+        .unwrap()
+        .expect("same-parent dedup install should succeed");
+
+    // ONE dependency node — not three
+    assert_eq!(rec.packages.len(), 1, "{:?}", rec.packages);
+    // ONE shared-cache entry, providing ALL THREE module names
+    let entries = libs_entries(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let meta_text = fs::read_to_string(entries[0].1.join("meta.toml")).unwrap();
+    let meta: toml::Value = toml::from_str(&meta_text).unwrap();
+    let provides = meta
+        .get("provides")
+        .and_then(|p| p.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    for module in ["fake-glib-2.0", "fake-gio-unix-2.0", "fake-gobject-2.0"] {
+        assert!(
+            provides.contains(&module),
+            "single built entry must provide `{module}`: {provides:?}"
+        );
+    }
+    // ONE dep sandbox cloned
+    let deps_dir = cfg.apps_dir.join(&rec.name).join("deps");
+    let dep_subdirs: Vec<_> = fs::read_dir(&deps_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(dep_subdirs.len(), 1, "one fetch, not three: {deps_dir:?}");
+    // all three .pc files present in the single entry
+    for module in ["fake-glib-2.0", "fake-gio-unix-2.0", "fake-gobject-2.0"] {
+        assert!(
+            entries[0]
+                .1
+                .join(format!("lib/pkgconfig/{module}.pc"))
+                .is_file()
+        );
+    }
+    // and the binary links against the ONE built parent library
+    let bin = fx.root.join("bin/deduphello");
+    let out = Command::new(&bin).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "g=42\n");
 }
 
 // ---------------------------------------------------------------------------

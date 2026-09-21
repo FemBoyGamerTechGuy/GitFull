@@ -21,7 +21,12 @@ src/
 ├── sandbox.rs     per-app sandbox layout + build environment assembly
 ├── privilege.rs   root-privilege model: euid check, per-command gating
 ├── search.rs      ranked forge search: candidate fetch, enrichment,
-│                  scoring, visible resolution (bare-name installs)
+│                  scoring, visible resolution (bare-name installs);
+│                  dependency-name candidates are returned UNCONFIRMED
+├── libmap.rs      curated upstream map: well-known pkg-config module
+│                  names -> their correct upstream repositories (the
+│                  primary strategy for resolving module names; ranked
+│                  search is only a flagged, never-auto-built fallback)
 ├── json.rs        hand-written JSON parser (search responses; no crates)
 ├── toolchain.rs   shared versioned toolchains: catalog, scanning,
 │                  constraint-aware selection, seed-GCC plan,
@@ -272,10 +277,13 @@ under `subprojects/`) resolve in-tree — nothing is fetched for them.
 
 Discovery is **generic across arbitrary repositories**. It is driven
 exclusively by parsing each build system's own manifest format at
-install time. gitfull contains **no per-repo, per-project or per-library
-name tables** — the only name lists in `depgraph.rs` are
+install time. `depgraph.rs` contains **no per-repo, per-project or
+per-library name tables** — the only name lists in it are
 build-system-semantic skip sets (built-ins, libc pieces), which describe
-build-system semantics rather than any particular project. This
+build-system semantics rather than any particular project. (Resolution —
+"where does this module name come from" — is a different question from
+discovery, answered by the curated upstream map + flagged search
+fallback; see the resolution layers above.) This
 constraint is deliberate and load-bearing: the implementation **must
 generalize across repositories and must never be tuned to any specific
 test case, fixture, or example project**. The test suite enforces it by
@@ -309,12 +317,71 @@ layers, in order:
 6. **shared library cache** — `<root>/libs/` entries matched by the
    names the built library actually *provides* (`.pc` module stems,
    `*Config.cmake` packages, `lib*.a/.so` members).
-7. **ranked forge search** — the generic name→repo mapping over all
-   configured forges (same ranking as bare-name installs; no name
-   tables anywhere).
+7. **the curated upstream map** ([`libmap.rs`](#curated-upstream-map-
+   libmaprs)) — well-known pkg-config module names → their correct
+   upstream repository. This is the *primary* strategy for module names:
+   a module→upstream mapping is knowledge, not something star-ranking
+   can infer. Maintenance branches are pinned where the module name
+   demands it (`sdl2` → the SDL repo's `SDL2` branch, `gtk+-3.0` →
+   `gtk-3-24`). Module names mapping to the same parent repository
+   (`glib-2.0`, `gio-unix-2.0`, `gobject-2.0` → GLib) deduplicate to a
+   single fetch/build through the identity-based walk dedup.
+8. **ranked forge search — flagged fallback only.** Used when a name is
+   in no layer above. Its result is **never silently auto-built**:
+   candidates are printed flagged `UNCONFIRMED`, and proceeding
+   requires either an interactive TTY confirmation (`y`) or a
+   `[dep.<name>]` config pin (the sanctioned non-interactive path for
+   scripts/CI/`--yes`-style runs — `--yes` deliberately does NOT
+   bypass this gate). Rationale: star/contributor/commit ranking
+   answers *"what's a popular repo matching this text"*, which has no
+   reliable correspondence to *"what is the correct upstream source for
+   this pkg-config module"* — module names frequently are modules
+   inside a parent library's repository (`gio-unix-2.0` is a GLib
+   module; no repo is named that, so search finds nothing or something
+   unrelated), and generic names string-match unrelated projects.
+   `--dry-run` reports such deps as UNRESOLVED and skips their subtree
+   instead of failing.
 
-A name that no layer can resolve is a hard, actionable error naming the
-dependency and the `[dep.<name>]` pin syntax.
+A name that no layer can resolve (and that search cannot even find
+candidates for) is a hard, actionable error naming the dependency and
+the `[dep.<name>]` pin syntax. Bare-name **application** installs
+(`gitfull install <app>`) keep auto-selecting the top-ranked repo —
+there the user asked for "a popular repo matching this text", which is
+exactly what ranked search answers.
+
+## Curated upstream map (libmap.rs)
+
+An **upstream source map** for well-known pkg-config module names —
+the same kind of data as a distribution's package→source mapping or
+gitfull's own `toolchain::CATALOG`. It maps module names to the
+repositories their maintainers actually publish from:
+
+* seeded with common windowing/graphics/core-library modules — the
+  GLib family, the GTK family, cairo, pango, harfbuzz, freetype,
+  fontconfig, pixman, libsoup, json-glib, libadwaita, libgee,
+  libnotify, appstream, libarchive, libxml2, openssl, libcurl, sqlite,
+  zlib, libpng, libjpeg-turbo, SDL (2 and 3, on their correct
+  branches), wayland, libdrm, libinput, dbus, xkbcommon, and
+  similarly-scoped others — **seeded, not exhaustive**;
+* **extensible and overridable via configuration, not code**: a
+  `[dep.<name>]` entry in gitfull.conf always wins over the table
+  (that is also how names missing from the seed set are pinned — see
+  docs/CONFIG.md);
+* plain upstream clone URLs: hosts not registered as forges
+  (gitlab.gnome.org, gitlab.freedesktop.org, …) are fetched as
+  anonymous generic git remotes, so no forge configuration is needed
+  to use the map;
+* **not tuned to any test case**: no test fixture name appears in it,
+  and no code path special-cases any entry — the mechanisms
+  (curated-first ordering, flagged fallback, same-source dedup) are
+  name-agnostic and covered by tests over unrelated fixture repos.
+
+This table is deliberately *not* the "no name tables" rule the
+manifest-parsing layer follows (see the generality constraint below):
+depgraph.rs still contains zero per-repo knowledge — it parses
+whatever a repository declares. The curated map is the resolution
+side's equivalent of the toolchain catalog: shared, reviewable,
+config-overridable upstream data.
 
 ## Shared library cache (libcache.rs)
 

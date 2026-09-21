@@ -55,12 +55,19 @@ $ sudo gitfull install meson       # ONE command does everything
 * **Manifest-driven dependency graphs** — gitfull parses each build
   system's *own* dependency declarations (meson `dependency()`/wraps,
   cmake `find_package()`/`pkg_check_modules()`, `Cargo.toml`,
-  `configure.ac`, Makefile `pkg-config` calls), resolves every declared
-  library through generic layers (user `[dep.<name>]` pins, the shared
-  library cache, meson wraps, ranked forge search), builds it from
-  source with the toolchain-managed compiler, and caches it under
-  `<root>/libs/` so a second app needing the same library never
-  rebuilds. Discovery is fully generic — no per-repo name tables.
+  `configure.ac`, Makefile `pkg-config` calls) and provisions every
+  declared library. Module names resolve **curated-mapping-first**:
+  user `[dep.<name>]` pins, meson wraps, the shared library cache, then
+  a built-in curated upstream map of well-known pkg-config modules
+  (GLib/GTK families, cairo, pango, harfbuzz, SDL, wayland, …) — and
+  ranked forge search is only a *flagged fallback* whose unconfirmed
+  matches are never auto-built (interactive `y` confirmation or a
+  config pin required; sibling modules of one parent repo —
+  `glib-2.0` + `gio-unix-2.0` — deduplicate to a single
+  fetch/build). Libraries are built from source with the
+  toolchain-managed compiler and cached under `<root>/libs/` so a
+  second app needing the same library never rebuilds. Discovery
+  parsing is fully generic — no per-repo name tables.
 
 
 $ gitfull list                     # read-only: no root needed
