@@ -1,0 +1,166 @@
+# ============================================================================
+# gitfull.conf — system-wide configuration for gitfull
+# ============================================================================
+#
+# Location: /etc/gitfull.conf  (override per-invocation: --config <path>)
+# Format:   TOML (subset as documented in docs/CONFIG.md)
+#
+# Design notes:
+#   * This file is OPTIONAL — gitfull runs on built-in defaults until it
+#     exists (gitfull will warn and use /var/lib/gitfull + github).
+#   * The forge schema is extensible WITHOUT code changes: any
+#     [forge.<name>] entry teaches gitfull a new forge (see docs/CONFIG.md).
+#   * gitfull never stores token VALUES in this file. Tokens are read from
+#     environment variables only (token_env below names the variable).
+
+# ----------------------------------------------------------------------------
+# [core] — global settings
+# ----------------------------------------------------------------------------
+[core]
+# Sandbox/toolchain root. EVERYTHING gitfull writes lives under here —
+# apps, toolchains, cache, logs, audit.log. The only additional write
+# target in gitfull's entire design is core.bin_dir (final binaries).
+root = "/var/lib/gitfull"
+
+# Destination for final built binaries. This is the single sanctioned
+# crossing point between an app sandbox and the host system.
+bin_dir = "/usr/local/bin"
+
+# Build parallelism (-j).
+jobs = 4
+
+# PATH entries for POSIX utilities (sh, coreutils, tar, ...) that
+# in-sandbox build systems may invoke. These are TOOLS operating on
+# sandbox paths only — see docs/AUDIT.md ("host utility invocations") for
+# the rationale and how to achieve full strictness (busybox toolchain).
+host_tool_path = "/usr/bin:/bin"
+
+# ANSI colors on the clone progress bar: auto | always | never
+color = "auto"
+
+# ----------------------------------------------------------------------------
+# [paths] — optional directory overrides (default: <root>/<name>)
+# ----------------------------------------------------------------------------
+[paths]
+# apps        = "/var/lib/gitfull/apps"
+# toolchains  = "/var/lib/gitfull/toolchains"
+# cache       = "/var/lib/gitfull/cache"
+# logs        = "/var/lib/gitfull/logs"
+
+# ----------------------------------------------------------------------------
+# [forge] — the forge registry (data, not code)
+# ----------------------------------------------------------------------------
+# `default` selects the forge used for bare `owner/repo` specs.
+# Every other key below [forge] defines a forge entry. Built-ins provided
+# out of the box: github, gitlab, codeberg. Entries here can customize
+# built-ins (same name) or define entirely new forges — no code changes.
+[forge]
+default = "github"
+
+# GitHub — the default forge (customized here with a token_env).
+[forge.github]
+kind = "github"
+host = "github.com"
+# Name of the environment variable holding an OPTIONAL read token for
+# cloning private repos. gitfull never reads token values from this file.
+token_env = "GITFULL_TOKEN"
+# A token looks like (fake placeholder showing the FORMAT only — never
+# commit a real one; the real value lives only in the token_env variable):
+# token = "github_pat_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOO"
+
+# GitLab (built-in defaults shown for reference).
+[forge.gitlab]
+kind = "gitlab"
+host = "gitlab.com"
+
+# Codeberg (Forgejo).
+[forge.codeberg]
+kind = "forgejo"
+host = "codeberg.org"
+
+# A self-hosted Gitea instance — plain config entry, zero code changes.
+[forge.gitea-selfhost]
+kind = "gitea"
+host = "git.corp.example.com"
+scheme = "https"
+port = 3000
+
+# A fully generic forge defined by a URL template. Valid template vars:
+#   {name} {kind} {scheme} {host} {port} {owner} {repo}
+[forge.mirror]
+kind = "generic"
+host = "git.example.com"
+clone_template = "https://{host}/src/{owner}/{repo}.git"
+
+# ----------------------------------------------------------------------------
+# [repo."owner/name"] — per-repository overrides
+# ----------------------------------------------------------------------------
+# Keys are quoted since they contain '/'. Works for any forge's repos.
+[repo."acme/secret-tool"]
+# Route through a different forge than the default (e.g. an internal
+# mirror), without touching the upstream spec on the command line.
+forge = "mirror"
+# Pin a branch/tag/commit.
+ref = "v1.2.0"
+# Extra toolchain requirements beyond auto-detection ("comp OP version").
+toolchains = ["gcc>=13"]
+# Package dependencies — other forge repos, built inside the app sandbox.
+packages = ["acme/libfoundation"]
+# Explicit final binaries (overrides staging-area scanning).
+# bins = ["secret-tool"]
+
+# ----------------------------------------------------------------------------
+# [toolchain] — toolchain management
+# ----------------------------------------------------------------------------
+[toolchain]
+# Seed GCC version. There is NO built-in default: unset means gitfull
+# auto-detects the LATEST stable GCC release tag from the GCC git repo at
+# bootstrap time. Pin an older version here when a build needs one:
+# seed_gcc_version = "13.3.0"
+
+[toolchain.preferences]
+# Preferred versions per component (used by `gitfull toolchain build`).
+# Leave commented to track "latest".
+# gcc    = "13.3.0"
+# python = "3.12.4"
+# meson  = "1.5.1"
+# ninja  = "1.12.1"
+# cmake  = "3.30.2"
+# vala   = "0.56.17"
+# rust   = "1.80.0"
+
+[toolchain.sources]
+# Source overrides per component (git URL, or tarball URL with {version}).
+# gcc    = "https://gcc.gnu.org/git/gcc.git"
+# python = "https://github.com/python/cpython.git"
+# meson  = "https://github.com/mesonbuild/meson.git"
+# ninja  = "https://github.com/ninja-build/ninja.git"
+# cmake  = "https://gitlab.com/cmake/cmake.git"
+# vala   = "https://gitlab.gnome.org/GNOME/vala.git"
+# rust   = "https://static.rust-lang.org/dist/rust-{version}-x86_64-unknown-linux-gnu.tar.xz"
+
+# ----------------------------------------------------------------------------
+# [policy] — enforcement policy
+# ----------------------------------------------------------------------------
+[policy]
+# Additional forbidden programs, on top of gitfull's built-in denylist of
+# host package managers (pacman, apt, dnf, xbps, ...) and privilege
+# escalators (sudo, doas, ...). Enforced at the exec chokepoint: these
+# programs can never be spawned by gitfull, period.
+extra_forbidden_programs = ["company-pm"]
+
+# Target apps may build copyleft-licensed code inside their own sandboxes.
+# gitfull itself never links that code — it only orchestrates — so target
+# license terms do not attach to gitfull. Set false to refuse such builds.
+allow_copyleft_targets = true
+
+# ----------------------------------------------------------------------------
+# [clone] — clone behavior
+# ----------------------------------------------------------------------------
+[clone]
+# Shallow clone depth (omit/uncomment for full history).
+# depth = 1
+# Clone only the target branch (default true).
+single_branch = true
+# Initialize git submodules after clone (default false).
+recurse_submodules = false

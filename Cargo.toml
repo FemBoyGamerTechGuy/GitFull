@@ -1,0 +1,32 @@
+[package]
+name = "gitfull"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Forge-agnostic package manager that treats Git-forge-hosted repositories as packages and builds them inside isolated sandboxes"
+license-file = "LICENSE"
+publish = false
+repository = "https://github.com/FemBoyGamerTechGuy/GitFull"
+readme = "README.md"
+keywords = ["package-manager", "git", "sandbox", "forge", "toolchain"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "gitfull"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitfull"
+path = "src/main.rs"
+
+# Dependency policy (docs/AUDIT.md):
+#   - no copyleft-licensed crates
+#   - no Red Hat-associated system software (D-Bus, systemd, GTK, ...)
+#   - aggressively minimized: config parsing only
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 2
+strip = true

@@ -1,0 +1,35 @@
+gitfull — proprietary software
+Copyright (c) 2026 FemBoyGamerTechGuy. All rights reserved.
+
+This software, its source code, and all accompanying files (including
+documentation, configuration examples, and build files; collectively, the
+"Software") are proprietary and confidential to the copyright holder.
+
+All rights are reserved by the copyright holder. No license, express or
+implied, is granted by this notice or by possession of the Software,
+including any implied warranty of merchantability, fitness for a particular
+purpose, or non-infringement of third-party rights. No right to use, copy,
+modify, merge, publish, distribute, sublicense, or sell copies of the
+Software is granted except as may be explicitly agreed in writing by the
+copyright holder.
+
+Unauthorized copying, distribution, modification, public display, or other
+use of the Software, in whole or in part, is strictly prohibited.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS THEREIN.
+
+--------------------------------------------------------------------------------
+Third-party dependency notice
+--------------------------------------------------------------------------------
+gitfull's own dependency set is intentionally minimal and strictly
+permissively licensed: `serde` and `toml` (MIT OR Apache-2.0). See
+docs/AUDIT.md for the full dependency-license posture.
+
+gitfull acts as an orchestrator: when it builds a *target* package for a
+user, that package (and its own dependencies, whatever their licenses) is
+fetched and built strictly inside that package's isolated sandbox. gitfull
+neither links nor incorporates that code into itself, so target-package
+license terms do not attach to gitfull.

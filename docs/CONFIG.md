@@ -1,0 +1,167 @@
+# CONFIG.md — the `/etc/gitfull.conf` reference
+
+gitfull's system-wide configuration lives at `/etc/gitfull.conf`
+(per-invocation override: `gitfull --config <path> …`). The format is
+TOML, parsed with `serde` + `toml` — the only crates gitfull depends on.
+
+The file is **optional**: gitfull runs on built-in defaults until it
+exists (and warns that it is doing so). An annotated example ships at
+`config/gitfull.conf.example`.
+
+Design principles:
+
+* **Forges are data.** New forges are added with a `[forge.<name>]`
+  entry — no code changes (§2).
+* **Fixed sections reject unknown keys** (typos fail loudly), but forge
+  entries and top-level *sections* are forward-compatible: unknown keys
+  inside a forge entry are accepted, unknown top-level sections warn.
+
+---
+
+## 1. `[core]` — global settings
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `root` | path | `/var/lib/gitfull` | everything gitfull writes lives under here (apps, toolchains, cache, logs, audit.log) |
+| `bin_dir` | path | `/usr/local/bin` | destination of the single sandbox-escape path (final binary copy) |
+| `jobs` | int | CPU count | build parallelism (`-j`) |
+| `host_tool_path` | string | `/usr/bin:/bin` | POSIX utilities available to in-sandbox builds (see docs/AUDIT.md §4; point at a busybox toolchain for full strictness) |
+| `color` | string | `"auto"` | progress-bar colors: `auto` \| `always` \| `never` |
+
+## 2. `[forge]` — the forge registry
+
+```toml
+[forge]
+default = "github"          # forge used for bare owner/repo specs
+
+[forge.<name>]
+kind           = "github"   # github | gitlab | gitea | forgejo | cgit | generic
+host           = "github.com"
+scheme         = "https"    # default https
+port           = 3000       # optional
+clone_template = "https://{host}/src/{owner}/{repo}.git"   # optional
+token_env      = "GITFULL_TOKEN"    # optional: env var name for a read token
+```
+
+* **Built-ins**: `github`, `gitlab`, `codeberg` are pre-registered; a
+  config entry with the same name *customizes* the built-in (the example
+  config adds `token_env` to `github`).
+* **Any other name defines a new forge.** For kinds gitfull has no URL
+  rule for, or to override URL shape entirely, set `clone_template`.
+  Valid template variables: `{name}` `{kind}` `{scheme}` `{host}`
+  `{port}` `{owner}` `{repo}`. Unknown variables are configuration
+  errors (fail loudly).
+* **`generic` + template covers any forge** — cgit, cgit-fe, private
+  mirrors, future forges: zero code changes, now or later.
+* Unknown keys inside a forge entry are accepted and ignored
+  (forward compatibility for future forge features).
+* The name `default` is reserved (it collides with the scalar
+  `forge.default` key).
+* **Tokens are never values in this file.** `token_env` names an
+  environment variable; if set (and non-empty) it is embedded into the
+  clone URL for that forge only, and redacted from every log. Example
+  placeholder format (fake — never commit a real token):
+  `github_pat_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOO`
+
+### Adding a forge without code changes — walkthrough
+
+Your company runs Gitea at `git.corp.example.com:3000`:
+
+```toml
+[forge.corp]
+kind = "gitea"
+host = "git.corp.example.com"
+port = 3000
+token_env = "CORP_GIT_TOKEN"     # optional, for private repos
+```
+
+Now `gitfull install corp:team/tool` clones from
+`https://git.corp.example.com:3000/team/tool.git`.
+
+A cgit instance with a nonstandard path layout:
+
+```toml
+[forge.kernel-mirror]
+kind = "generic"
+host = "mirror.example.com"
+clone_template = "https://{host}/cgit/{owner}/{repo}.git"
+```
+
+## 3. `[repo."owner/name"]` — per-repository overrides
+
+Keys are quoted (they contain `/`). Works for any forge's repos; the
+lookup key is the plain `owner/repo` (for URL installs, the owner/repo
+the URL resolves to).
+
+| key | type | meaning |
+|---|---|---|
+| `forge` | string | route this repo through a different forge (e.g. an internal mirror) |
+| `ref` | string | pin a branch/tag/commit (CLI `@ref` wins over this) |
+| `build_system` | string | override auto-detection: `autotools` \| `make` \| `meson` \| `cmake` \| `cargo` |
+| `jobs` | int | per-repo build parallelism |
+| `packages` | [string] | additional package deps (`"owner/repo"` specs), built inside this app's sandbox |
+| `toolchains` | [string] | additional toolchain constraints, e.g. `"gcc>=13"` |
+| `bins` | [string] | explicit final binaries to install (overrides staging-area scanning) |
+
+Version constraint syntax: `component`, `component=V`,
+`component>V`, `component>=V`, `component<V`, `component<=V`
+(e.g. `gcc>=13.3.0`, `python=3.12`). Versions compare numerically per
+dot segment (`13.9 < 13.10`).
+
+## 4. `[paths]` — directory overrides
+
+All optional; each defaults to `<root>/<name>`:
+
+| key | default |
+|---|---|
+| `apps` | `<root>/apps` |
+| `toolchains` | `<root>/toolchains` |
+| `cache` | `<root>/cache` |
+| `logs` | `<root>/logs` |
+
+## 5. `[toolchain]` — toolchain management
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `seed_gcc_version` | string | *(unset)* | **There is no built-in default.** Unset means gitfull auto-detects the latest stable GCC release tag from the GCC git repo when bootstrap runs. Pin an older version here when needed. |
+| `preferences.<component>` | string | *(unset)* | preferred version per component (used by `gitfull toolchain build`) |
+| `sources.<component>` | string | *(catalog)* | source override per component — git URL, or tarball URL containing `{version}` |
+
+Catalog components and default sources: `gcc` (gcc.gnu.org git),
+`python` (github.com/python/cpython), `meson`
+(github.com/mesonbuild/meson), `ninja` (github.com/ninja-build/ninja),
+`cmake` (gitlab.com/cmake/cmake), `vala` (gitlab.gnome.org/GNOME/vala),
+`rust` (static.rust-lang.org tarball).
+
+## 6. `[policy]` — enforcement policy
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `extra_forbidden_programs` | [string] | `[]` | additional programs denied at the exec chokepoint (on top of the built-in package-manager + privilege-escalator denylist) |
+| `allow_copyleft_targets` | bool | `true` | target apps may build copyleft code inside their own sandboxes (gitfull never links it — see docs/AUDIT.md §6) |
+
+## 7. `[clone]` — clone behavior
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `depth` | int | *(unset)* | shallow clone depth (unset = full history) |
+| `single_branch` | bool | `true` | clone only the target branch |
+| `recurse_submodules` | bool | `false` | initialize submodules after clone |
+
+## 8. TOML subset notes
+
+* comments (`#`), `[section]` tables, quoted keys
+  (`[repo."a/b"]`), strings, integers, booleans, arrays of strings are
+  used;
+* inline tables and multi-line strings are not used by the schema;
+* unknown top-level sections produce **warnings**, not errors;
+* unknown keys in `[core]`, `[paths]`, `[toolchain]`, `[policy]`,
+  `[clone]`, and `[repo.*]` entries are **errors** (typo protection);
+* unknown keys inside `[forge.*]` entries are accepted (extensibility).
+
+## 9. Command-line overrides
+
+`--config <path>` selects the file; `--root <path>` overrides
+`core.root` (and re-derives the `[paths]` defaults). Global options go
+**before** the command; command options (e.g. `--execute`, `--version`)
+go after it.
