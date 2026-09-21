@@ -52,6 +52,16 @@ $ sudo gitfull install meson       # ONE command does everything
 #      fetched and built automatically — the seed GCC is the only build
 #      that ever touches the host compiler, and gitfull runs it for you;
 #   3. the app is built in its sandbox and the final binary copied out.
+* **Manifest-driven dependency graphs** — gitfull parses each build
+  system's *own* dependency declarations (meson `dependency()`/wraps,
+  cmake `find_package()`/`pkg_check_modules()`, `Cargo.toml`,
+  `configure.ac`, Makefile `pkg-config` calls), resolves every declared
+  library through generic layers (user `[dep.<name>]` pins, the shared
+  library cache, meson wraps, ranked forge search), builds it from
+  source with the toolchain-managed compiler, and caches it under
+  `<root>/libs/` so a second app needing the same library never
+  rebuilds. Discovery is fully generic — no per-repo name tables.
+
 
 $ gitfull list                     # read-only: no root needed
 $ gitfull info meson               # read-only: record + ranked resolution

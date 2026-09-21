@@ -126,7 +126,35 @@ Version constraint syntax: `component`, `component=V`,
 (e.g. `gcc>=13.3.0`, `python=3.12`). Versions compare numerically per
 dot segment (`13.9 < 13.10`).
 
-## 4. `[paths]` — directory overrides
+## 4. `[dep.<name>]` — per-dependency resolution overrides
+
+Keyed by the name a build manifest declares — meson
+`dependency('name')`, cmake `find_package(Name)`, autotools
+`AC_CHECK_LIB([name])`, a Makefile `pkg-config` module. Matching is
+exact key first, then case-insensitive (manifest names arrive in their
+native case: `find_package(ZLIB)` vs `[dep.zlib]`).
+
+```toml
+[dep.zlib]
+source = "gitlab:madler/zlib"    # any spec form: forge:owner/repo,
+ref = "develop"                  # owner/repo, a URL, or a local path
+skip = false                     # never provision this dependency
+```
+
+| key | type | meaning |
+|---|---|---|
+| `source` | string | pin where this dependency comes from — use it when ranked search picks a repo you do not want, or to point at a fork, mirror, or local checkout (validated at config load) |
+| `ref` | string | pin a branch/tag/commit; requires `source` |
+| `skip` | bool | deliberate opt-out: never provision this dependency (e.g. a project declares a dependency it does not actually need) |
+
+Without an override, dependency names discovered from manifests resolve
+through generic layers only — shared library cache, meson wraps, then
+ranked forge search (see docs/ARCHITECTURE.md, "Dependency-graph
+discovery"). These overrides are *user configuration*, mirroring
+`[toolchain.sources]`; gitfull itself contains no per-repo or
+per-library name tables.
+
+## 5. `[paths]` — directory overrides
 
 All optional; each defaults to `<root>/<name>`:
 
@@ -134,10 +162,18 @@ All optional; each defaults to `<root>/<name>`:
 |---|---|
 | `apps` | `<root>/apps` |
 | `toolchains` | `<root>/toolchains` |
+| `libs` | `<root>/libs` |
 | `cache` | `<root>/cache` |
 | `logs` | `<root>/logs` |
 
-## 5. `[toolchain]` — toolchain management
+`paths.libs` is the **shared library cache**: library dependencies
+discovered from build manifests are built from source and registered
+here (identity-keyed entries with `meta.toml` provenance and link
+closure). Every later install needing the same library reuses the entry
+instead of rebuilding; entries are never removed with an app
+(toolchain-style sharing).
+
+## 6. `[toolchain]` — toolchain management
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -151,14 +187,14 @@ Catalog components and default sources: `gcc` (gcc.gnu.org git),
 `cmake` (gitlab.com/cmake/cmake), `vala` (gitlab.gnome.org/GNOME/vala),
 `rust` (static.rust-lang.org tarball).
 
-## 6. `[policy]` — enforcement policy
+## 7. `[policy]` — enforcement policy
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `extra_forbidden_programs` | [string] | `[]` | additional programs denied at the exec chokepoint (on top of the built-in package-manager + privilege-escalator denylist) |
 | `allow_copyleft_targets` | bool | `true` | target apps may build copyleft code inside their own sandboxes (gitfull never links it — see docs/AUDIT.md §6) |
 
-## 7. `[clone]` — clone behavior
+## 8. `[clone]` — clone behavior
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -166,7 +202,7 @@ Catalog components and default sources: `gcc` (gcc.gnu.org git),
 | `single_branch` | bool | `true` | clone only the target branch |
 | `recurse_submodules` | bool | `false` | initialize submodules after clone |
 
-## 8. TOML subset notes
+## 9. TOML subset notes
 
 * comments (`#`), `[section]` tables, quoted keys
   (`[repo."a/b"]`), strings, integers, booleans, arrays of strings are
@@ -177,7 +213,7 @@ Catalog components and default sources: `gcc` (gcc.gnu.org git),
   `[clone]`, and `[repo.*]` entries are **errors** (typo protection);
 * unknown keys inside `[forge.*]` entries are accepted (extensibility).
 
-## 9. Command-line overrides
+## 10. Command-line overrides
 
 `--config <path>` selects the file; `--root <path>` overrides
 `core.root` (and re-derives the `[paths]` defaults). Global options go

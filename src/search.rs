@@ -474,11 +474,6 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
         }
     };
 
-    let forges: Vec<&Forge> = match &scope {
-        Some(f) => vec![cfg.forges.get(f)?],
-        None => cfg.forges.all().collect(),
-    };
-
     println!(
         "gitfull: searching {} for `{term}` (matching repositories are ranked by \
          stars, contributors, commits, and recency; the top one is auto-selected)",
@@ -488,6 +483,100 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
         }
     );
 
+    let forges: Vec<&Forge> = match &scope {
+        Some(f) => vec![cfg.forges.get(f)?],
+        None => cfg.forges.all().collect(),
+    };
+    let (mut candidates, searchable, failed) = gather_candidates(cfg, ctx, &forges, &term);
+
+    if candidates.is_empty() {
+        let mut err = empty_result_error(&term, searchable, failed);
+        if let GitfullError::Unsupported(msg) = &mut err {
+            msg.push_str(
+                ". Use an explicit form instead: `forge:owner/repo`, `owner/repo`, \
+                 a URL, or a local path",
+            );
+        }
+        return Err(err);
+    }
+
+    enrich_and_rank(cfg, ctx, &mut candidates);
+    print_resolution(
+        &term,
+        &candidates,
+        &match &scope {
+            Some(f) => format!("on forge `{f}`"),
+            None => "across configured forges".to_string(),
+        },
+    );
+
+    let top = &candidates[0];
+    Ok(PkgSpec {
+        source: Source::Forge {
+            forge: Some(top.forge.clone()),
+            owner: top.owner.clone(),
+            repo: top.repo.clone(),
+        },
+        git_ref: spec.git_ref.clone(),
+    })
+}
+
+/// Resolve ONE dependency name (parsed out of a build manifest by
+/// [`crate::depgraph`]) to a concrete `forge:owner/repo` spec — the same
+/// ranked-search mechanism as [`resolve`], with compact output suitable
+/// for the many resolutions an install may perform.
+///
+/// Like `resolve`, this is fully generic: the name→repo mapping comes
+/// from the configured forges' search APIs and the ranking, never from
+/// a table in the code.
+pub fn resolve_dep_name(cfg: &Config, ctx: &ExecCtx, name: &str) -> Result<PkgSpec> {
+    let forges: Vec<&Forge> = cfg.forges.all().collect();
+    let (mut candidates, searchable, failed) = gather_candidates(cfg, ctx, &forges, name);
+
+    if candidates.is_empty() {
+        let mut msg = empty_result_error(name, searchable, failed).to_string();
+        msg.push_str(&format!(
+            ". Pin it explicitly with [dep.\"{name}\"] source = \"forge:owner/repo\" \
+             in gitfull.conf"
+        ));
+        return Err(GitfullError::Unsupported(msg));
+    }
+
+    enrich_and_rank(cfg, ctx, &mut candidates);
+    let top = &candidates[0];
+    println!(
+        "gitfull: dep `{name}` resolved to {}:{} (rank 1 of {}; score {:.2}; {})",
+        top.forge,
+        top.full_name(),
+        candidates.len(),
+        top.score,
+        match (top.stars, top.last_activity) {
+            (s, Some(ts)) => format!(
+                "{} stars, last active {}",
+                format_count(s),
+                format_age(ts, util::epoch())
+            ),
+            (s, None) => format!("{} stars", format_count(s)),
+        }
+    );
+    Ok(PkgSpec {
+        source: Source::Forge {
+            forge: Some(top.forge.clone()),
+            owner: top.owner.clone(),
+            repo: top.repo.clone(),
+        },
+        git_ref: None,
+    })
+}
+
+/// Query every forge for `term`. Returns (candidates, searchable forge
+/// count, failed forge count); per-forge failures are warned, not fatal.
+fn gather_candidates(
+    cfg: &Config,
+    ctx: &ExecCtx,
+    forges: &[&Forge],
+    term: &str,
+) -> (Vec<Candidate>, usize, usize) {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut searchable = 0;
     let mut failed = 0;
@@ -501,7 +590,7 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
             continue;
         }
         searchable += 1;
-        match query_forge(cfg, ctx, forge, &term) {
+        match query_forge(cfg, ctx, forge, term) {
             Ok(mut cs) => {
                 if cs.is_empty() {
                     println!("gitfull: forge `{}`: no matches", forge.name);
@@ -514,30 +603,30 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
             }
         }
     }
+    (candidates, searchable, failed)
+}
 
-    if candidates.is_empty() {
-        let searched = if searchable == 0 {
-            "no configured forge has a search API".to_string()
-        } else {
-            format!(
-                "searched {} searchable forge(s){}",
-                searchable,
-                if failed > 0 {
-                    format!(" ({failed} failed — see warnings above)")
-                } else {
-                    String::new()
-                }
-            )
-        };
-        return Err(GitfullError::Unsupported(format!(
-            "no repository matching `{term}` was found ({searched}). Use an \
-             explicit form instead: `forge:owner/repo`, `owner/repo`, a URL, \
-             or a local path"
-        )));
-    }
+fn empty_result_error(term: &str, searchable: usize, failed: usize) -> GitfullError {
+    let searched = if searchable == 0 {
+        "no configured forge has a search API".to_string()
+    } else {
+        format!(
+            "searched {} searchable forge(s){}",
+            searchable,
+            if failed > 0 {
+                format!(" ({failed} failed — see warnings above)")
+            } else {
+                String::new()
+            }
+        )
+    };
+    GitfullError::Unsupported(format!(
+        "no repository matching `{term}` was found ({searched})"
+    ))
+}
 
-    // GitHub enrichment: only the few strongest candidates, to stay well
-    // inside unauthenticated rate limits.
+/// GitHub enrichment for the few strongest candidates + final ranking.
+fn enrich_and_rank(cfg: &Config, ctx: &ExecCtx, candidates: &mut [Candidate]) {
     let github_api = cfg
         .forges
         .all()
@@ -558,26 +647,7 @@ pub fn resolve(cfg: &Config, ctx: &ExecCtx, spec: &PkgSpec) -> Result<PkgSpec> {
             enrich_github(cfg, ctx, &api, cand, &mut rate_warned);
         }
     }
-
-    rank(&mut candidates, util::epoch());
-    print_resolution(
-        &term,
-        &candidates,
-        &match &scope {
-            Some(f) => format!("on forge `{f}`"),
-            None => "across configured forges".to_string(),
-        },
-    );
-
-    let top = &candidates[0];
-    Ok(PkgSpec {
-        source: Source::Forge {
-            forge: Some(top.forge.clone()),
-            owner: top.owner.clone(),
-            repo: top.repo.clone(),
-        },
-        git_ref: spec.git_ref.clone(),
-    })
+    rank(candidates, util::epoch());
 }
 
 #[cfg(test)]

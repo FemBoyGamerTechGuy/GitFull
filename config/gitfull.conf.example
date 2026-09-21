@@ -44,6 +44,7 @@ color = "auto"
 [paths]
 # apps        = "/var/lib/gitfull/apps"
 # toolchains  = "/var/lib/gitfull/toolchains"
+# libs        = "/var/lib/gitfull/libs"
 # cache       = "/var/lib/gitfull/cache"
 # logs        = "/var/lib/gitfull/logs"
 
@@ -108,6 +109,21 @@ toolchains = ["gcc>=13"]
 packages = ["acme/libfoundation"]
 # Explicit final binaries (overrides staging-area scanning).
 # bins = ["secret-tool"]
+
+# ----------------------------------------------------------------------------
+# [dep.<name>] — per-dependency resolution overrides
+# ----------------------------------------------------------------------------
+# Keyed by the name a build manifest declares (meson dependency('name'),
+# cmake find_package(Name), autotools AC_CHECK_LIB([name]), a Makefile
+# pkg-config module). WITHOUT an override, names discovered from manifests
+# resolve generically: shared library cache -> meson wraps -> ranked forge
+# search. These entries are user pins, not code-side name tables.
+[dep."zlib"]
+# Pin a dependency to a specific source (any spec form) + ref:
+# source = "gitlab:madler/zlib"
+# ref    = "develop"
+# Or deliberately never provision a declared dependency:
+# skip   = true
 
 # ----------------------------------------------------------------------------
 # [toolchain] — toolchain management

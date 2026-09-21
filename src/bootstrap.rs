@@ -149,12 +149,14 @@ fn seed_gcc_resolved(
     let build_dir = cfg.toolchains_dir.join(format!(".build/gcc-{version}"));
     let tag = format!("releases/gcc-{version}");
 
-    // 1. fetch (sealed FetchTool)
+    // 1. fetch (sealed FetchTool) — with the same live progress UI every
+    //    clone in gitfull uses (main repos, dependencies, toolchains)
     if src.exists() {
         fs::remove_dir_all(&src)?;
     }
     println!("gitfull: fetching {source} (tag {tag})");
     let url = authed_url(&source, None);
+    let mut ui = crate::planner::clone_progress(cfg);
     gitproc::git_clone(
         &fctx,
         &url,
@@ -167,9 +169,13 @@ fn seed_gcc_resolved(
         },
         &host_tool_path,
         &git_home,
-        None,
+        Some(&mut ui),
     )?;
     let commit = gitproc::git_rev_parse_head(&fctx, &src, &host_tool_path, &git_home).ok();
+    ui.finish(&format!(
+        "gitfull: fetched {source} ({})",
+        commit.as_deref().unwrap_or("unknown commit")
+    ));
 
     // 2. prerequisites (GMP/MPFR/MPC) — sealed FetchTool
     println!("gitfull: downloading prerequisites (GMP/MPFR/MPC)");
@@ -343,13 +349,14 @@ pub fn build_component(
     }
 
     if spec.source_is_git {
-        // fetch via git (sealed)
+        // fetch via git (sealed) — live progress UI like every clone
         let src = mgr.source_cache_dir(component, &version);
         if src.exists() {
             fs::remove_dir_all(&src)?;
         }
         println!("gitfull: fetching {source}");
         let url = authed_url(&source, None);
+        let mut ui = crate::planner::clone_progress(cfg);
         gitproc::git_clone(
             &fctx,
             &url,
@@ -362,9 +369,13 @@ pub fn build_component(
             },
             &host_tool_path,
             &git_home,
-            None,
+            Some(&mut ui),
         )?;
         let commit = gitproc::git_rev_parse_head(&fctx, &src, &host_tool_path, &git_home).ok();
+        ui.finish(&format!(
+            "gitfull: fetched {source} ({})",
+            commit.as_deref().unwrap_or("unknown commit")
+        ));
 
         match component {
             "meson" => {

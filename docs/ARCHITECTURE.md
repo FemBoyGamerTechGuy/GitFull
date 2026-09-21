@@ -32,10 +32,21 @@ src/
 ├── manifest.rs    build-system auto-detection (+ optional gitfull.toml)
 ├── resolver.rs    version constraints, implicit toolchain needs,
 │                  per-repo requirement merging, cycle detection
+├── depgraph.rs    build-system-native dependency discovery: parses each
+│                  build system's OWN manifest format (meson
+│                  dependency()/wraps, cmake find_package()/find_library
+│                  /pkg_check_modules, Cargo.toml, configure.ac,
+│                  Makefile pkg-config calls) into declared deps —
+│                  generic across repos, no per-repo name tables
+├── libcache.rs   shared library cache <root>/libs/: content-addressed
+│                  entries for built library deps (provides-matching,
+│                  identity lookup, transitive link closure)
 ├── planner.rs     install pipeline: resolve (search?) → clone → detect →
-│                  dep walk → toolchain select (+ auto-provision) →
-│                  build → stage → collect → install_binaries (the
-│                  single sandbox escape) → meta
+│                  dep-graph discovery + walk (cycle-safe) → toolchain
+│                  select (+ auto-provision) → build deps leaves-first
+│                  (registering each in <root>/libs/) → build app →
+│                  stage → collect → install_binaries (the single
+│                  sandbox escape) → meta
 └── sha256.rs      dependency-free SHA-256 (provenance hashes)
 ```
 
@@ -53,9 +64,10 @@ src/
                                      │
                         ┌────────────┴─────────────┐
                         ▼                          ▼
-                 resolve_repo               dependency walk
-              (auto-detect build           (cycle-safe, deps cloned
-               system, merge needs)         into this app's sandbox)
+                 resolve_repo           dep-graph discovery
+              (auto-detect build      (depgraph.rs parses the repo's OWN
+               system, merge needs)    manifests; every dep resolved,
+                                        fetched w/ progress UI, cycle-safe)
                         └────────────┬─────────────┘
                                      ▼
                         toolchain selection (shared, constraint-aware)
@@ -63,7 +75,10 @@ src/
                         │   (AUTO-provision from source — seed GCC included;
                         │    never a package manager, never a manual step)
                         ▼
-              build deps (Toolchain class, hermetic env)
+              build deps leaves-first, registering each in the
+              shared library cache <root>/libs/ (identity-keyed;
+              a second app needing the same library never rebuilds)
+              (Toolchain class, hermetic env)
                         ▼
               build app  ──▶ stage ──▶ collect final binaries
                         ▼
@@ -153,6 +168,11 @@ reuses the same resolution read-only.
 ├── toolchains/<component>-<version>/   SHARED toolchains (gcc, python,
 │   ├── bin/                            meson, ninja, cmake, vala, rust)
 │   └── meta.toml    provenance (source, commit, built_by, date)
+├── libs/<slug>-<hash>/           SHARED library cache: built library
+│   ├── bin/ include/ lib/ …      dependencies (provides-matching,
+│   └── meta.toml                 identity-keyed, link closure) — never
+│                                 removed with an app, reused by every
+│                                 later install needing the same lib
 ├── cache/           cloned sources, downloaded tarballs
 ├── logs/            toolchain build logs
 └── audit.log        append-only: every exec + every binary copy
@@ -171,8 +191,11 @@ Every in-sandbox build runs with exactly this environment:
   resolved implicitly.
 * `HOME`/`TMPDIR` inside the sandbox; `LC_ALL=C`; `SHELL=/bin/sh`.
 * `CC`/`CXX` point at the toolchain-managed gcc/g++ (when required).
-* Dep prefixes are exported via `PKG_CONFIG_PATH`, `LD_LIBRARY_PATH`,
-  `CPPFLAGS`, `LDFLAGS`.
+* Dep prefixes — every shared-cache entry in the app's link closure —
+  are exported via `PKG_CONFIG_PATH`, `LD_LIBRARY_PATH`, `CPPFLAGS`,
+  `LDFLAGS`, so the build system's own dependency resolution (meson
+  `dependency()`, cmake `find_package()`, pkg-config `Requires:` chains)
+  resolves against provisioned libraries.
 * `DESTDIR` points at the sandbox staging dir.
 
 Programs resolve against this PATH **only** — there is no host-PATH
@@ -194,7 +217,7 @@ An *optional* `gitfull.toml` in a repo (or `[repo]` overrides in
 gitfull.conf) can force the build system or declare explicit binaries —
 never required.
 
-## Dependency resolution (resolver.rs + planner dep walk)
+## Dependency resolution (resolver.rs + depgraph.rs + planner)
 
 * **Toolchain needs** are implied by the detected build system (meson →
   gcc + python≥3.8 + meson + ninja; cargo → rust; …) and merged with
@@ -203,13 +226,131 @@ never required.
   through ranked forge search (see above) *before* the pipeline runs;
   `owner/repo` and `forge:owner/repo` specs never trigger a search.
 * **Package needs** are `[repo] packages = ["owner/repo", …]` — other
-  forge repos. The planner walks them breadth-first with a visited set
-  and cycle detection (`a -> b -> a` is a hard error), cloning each into
-  the requesting app's sandbox `deps/`, building it there, and exporting
-  its prefix to later builds via the build env.
-* Missing toolchains are never obtained from a host package manager
-  (impossible — see the denylist); gitfull tells you the exact
-  from-source command instead.
+  forge repos.
+* **Library needs** are discovered from the repo's own build manifests
+  by [`depgraph.rs`](#dependency-graph-discovery-depgraphrs) — the fix
+  for "the build tool was provisioned but its dependency resolution
+  still failed": gitfull now parses what the project *itself declares*
+  and provisions every declared library, transitively.
+
+The planner walks the full graph breadth-first with an identity-keyed
+visited set. A back-edge onto an ancestor is a cycle (hard error); an
+edge onto an already-visited non-ancestor is a diamond (deduplicated,
+linked once). Each dependency is cloned into the requesting app's
+sandbox `deps/` **with the same live progress UI as every other clone**
+(main repo, toolchain components, dependencies — one mechanism), built
+with the toolchain-managed compiler, and its install prefix is moved
+into the shared library cache. Builds run leaves-first (topological
+order), so a dependency's own dependencies are linkable while it builds.
+
+## Dependency-graph discovery (depgraph.rs)
+
+gitfull does **not** stop at "this project uses meson": it parses the
+build system's **own dependency declarations** in the cloned source tree
+and provisions every declared library dependency from source, exactly
+like it provisions toolchain components.
+
+| build system | files parsed | declarations recognized |
+|---|---|---|
+| meson | every `meson.build`, plus `subprojects/*.wrap` | `dependency('name', …)` calls (incl. multi-line, `required: false`, `version:`); `[wrap-git]`/`[wrap-file]` subprojects (with `[provide] dependency_names`) |
+| cmake | every `CMakeLists.txt` and `*.cmake` | `find_package(Name [ver] [REQUIRED])`, `find_library(VAR [NAMES] x …)`, `pkg_check_modules(PREFIX … module…)` |
+| cargo | `Cargo.toml` (workspace members too) | `[dependencies]` / `[build-dependencies]` / `[target.'cfg(…)'.dependencies]`; git deps carry their URL; registry deps are fetched by cargo itself |
+| autotools | `configure.ac` | `PKG_CHECK_MODULES([V], [mod >= ver …])`, `AC_CHECK_LIB`, `AC_SEARCH_LIBS` |
+| make | `Makefile` | `pkg-config … <module>` invocations (incl. `$(shell …)`) |
+
+Each declaration carries its kind, required/optional flag (meson
+`required: false`, cmake non-`REQUIRED`, autoconf 4-arg
+`PKG_CHECK_MODULES` soft form), version constraint (report-only — the
+build system's own dependency check stays the version authority), and a
+`file:line` origin. Build-system **built-ins** are skipped as
+build-system semantics, never fetched: meson `threads`/`gtest`/…,
+cmake `Threads`/`PkgConfig`/…, autotools libc pieces (`m`, `dl`,
+`pthread`, `resolv`, …). Vendored meson subprojects (checked-in trees
+under `subprojects/`) resolve in-tree — nothing is fetched for them.
+
+### Generality constraint (by design, enforced by tests)
+
+Discovery is **generic across arbitrary repositories**. It is driven
+exclusively by parsing each build system's own manifest format at
+install time. gitfull contains **no per-repo, per-project or per-library
+name tables** — the only name lists in `depgraph.rs` are
+build-system-semantic skip sets (built-ins, libc pieces), which describe
+build-system semantics rather than any particular project. This
+constraint is deliberate and load-bearing: the implementation **must
+generalize across repositories and must never be tuned to any specific
+test case, fixture, or example project**. The test suite enforces it by
+scanning several unrelated repository shapes with different dependency
+sets through the *same* parsers (`discovery_is_generic_across_unrelated_
+shapes`, plus per-build-system fixtures that share no names with each
+other), and the end-to-end tests drive discovery through fixture repos
+whose names are chosen to be obviously synthetic.
+
+### Resolution layers (per declared dependency)
+
+Every discovered dependency name is resolved through the same generic
+layers, in order:
+
+1. **cargo registry deps** — the cargo resolver fetches these into the
+   app's sandbox at build time (isolation-compliant by design); gitfull
+   reports them but does not provision them.
+2. **user override** — `[dep.<name>]` in gitfull.conf: `skip = true`, or
+   a pinned `source` (+ optional `ref`). This is *user configuration*
+   (mirroring `[toolchain.sources]`), not a code-side name table.
+3. **identity-level cache check** — a pinned source (override or meson
+   wrap) whose exact identity (`url|ref` / path / tarball URL) was
+   already built by an earlier install is reused outright: no clone, no
+   rebuild.
+4. **meson wraps** — the manifest's own pin files: `[wrap-git]` clones
+   the pinned URL/revision, `[wrap-file]` downloads + extracts the
+   pinned tarball (+ optional patch). Wraps no `dependency()` call
+   references are still honored (`meson subprojects download` policy —
+   over-provide, never under-provide).
+5. **vendored subprojects** — checked-in trees: satisfied in-tree.
+6. **shared library cache** — `<root>/libs/` entries matched by the
+   names the built library actually *provides* (`.pc` module stems,
+   `*Config.cmake` packages, `lib*.a/.so` members).
+7. **ranked forge search** — the generic name→repo mapping over all
+   configured forges (same ranking as bare-name installs; no name
+   tables anywhere).
+
+A name that no layer can resolve is a hard, actionable error naming the
+dependency and the `[dep.<name>]` pin syntax.
+
+## Shared library cache (libcache.rs)
+
+Library dependencies are built from source with the toolchain-managed
+compiler and their install prefixes are moved into `<root>/libs/`:
+
+```
+<root>/libs/<slug>-<identity-hash>/
+├── bin/ include/ lib/ …     whatever the library installed
+└── meta.toml                name, provides, source, git_ref, commit,
+                             requires (link closure), built_by, date
+```
+
+* **Identity addressing.** The cache key is derived from the resolved
+  source identity (clone URL + ref / local path / tarball URL), so it is
+  deterministic before the build runs. Lookup also works **by identity**
+  (`find_by_identity`) so the same physical library requested under an
+  alias name is reused, never rebuilt.
+* **Provides matching.** Lookup by *name* matches the names the built
+  tree actually provides, discovered from its own files — so
+  `dependency('zlib')` reuses an entry registered as `zlib` no matter
+  which repo built it.
+* **Link closure.** Each entry records the entries it was built against
+  (`requires`), expanded transitively (`closure_dirs`). When a later app
+  reuses an entry by name, its closure joins the link line — a static
+  `libfoo.a` whose objects reference `libbar` symbols links correctly
+  without this install ever fetching `libbar`. This is what makes
+  *reused* libraries as linkable as freshly built ones.
+* **Sharing semantics.** Like toolchain components, entries are
+  content-addressed and never mutated after registration; `gitfull
+  remove` never deletes them (other apps may reference them).
+
+Optional dependencies (per the manifest's own flags) are reported and
+never provisioned. Missing toolchains are never obtained from a host
+package manager (impossible — see the denylist); gitfull tells you the
+exact from-source command instead.
 
 ## Toolchain catalog & bootstrap
 

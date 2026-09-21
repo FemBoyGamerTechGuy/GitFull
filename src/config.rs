@@ -103,6 +103,8 @@ pub struct PathsSection {
     pub cache: Option<PathBuf>,
     #[serde(default)]
     pub logs: Option<PathBuf>,
+    #[serde(default)]
+    pub libs: Option<PathBuf>,
 }
 
 /// `[forge]` — the forge registry.
@@ -144,6 +146,31 @@ pub struct RepoOverride {
     /// Explicit final binaries to install (overrides stage scanning).
     #[serde(default)]
     pub bins: Vec<String>,
+}
+
+/// `[dep.<name>]` — per-dependency resolution override, keyed by the
+/// name as declared in a build manifest (meson `dependency('name')`,
+/// cmake `find_package(Name)`, autotools `AC_CHECK_LIB([name])`, ...).
+///
+/// This is *user configuration* (mirroring `[toolchain.sources]`), not a
+/// code-side name table: it exists so users can pin a dependency to a
+/// specific source, mirror, or local path, deterministically. Without
+/// an override, dependency names are resolved generically through the
+/// ranked forge search.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DepOverride {
+    /// Any spec form: `forge:owner/repo`, `owner/repo`, a URL, or a
+    /// local path.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Pin a branch/tag/commit (requires `source`).
+    #[serde(rename = "ref", default)]
+    pub git_ref: Option<String>,
+    /// Never provision this dependency (a deliberate opt-out, e.g. when
+    /// a project declares a dependency it does not actually need).
+    #[serde(default)]
+    pub skip: bool,
 }
 
 /// `[toolchain]` — toolchain management.
@@ -220,6 +247,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub repo: BTreeMap<String, RepoOverride>,
     #[serde(default)]
+    pub dep: BTreeMap<String, DepOverride>,
+    #[serde(default)]
     pub toolchain: ToolchainSection,
     #[serde(default)]
     pub policy: PolicySection,
@@ -261,8 +290,10 @@ pub struct Config {
     pub toolchains_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub logs_dir: PathBuf,
+    pub libs_dir: PathBuf,
     pub forges: Registry,
     pub repos: BTreeMap<String, RepoOverride>,
+    pub deps: BTreeMap<String, DepOverride>,
     pub toolchain: ToolchainSection,
     pub policy: PolicySection,
     pub clone: CloneSection,
@@ -294,6 +325,7 @@ impl Config {
             "paths",
             "forge",
             "repo",
+            "dep",
             "toolchain",
             "policy",
             "clone",
@@ -328,6 +360,7 @@ impl Config {
             .unwrap_or_else(|| root.join("toolchains"));
         let cache_dir = fc.paths.cache.unwrap_or_else(|| root.join("cache"));
         let logs_dir = fc.paths.logs.unwrap_or_else(|| root.join("logs"));
+        let libs_dir = fc.paths.libs.unwrap_or_else(|| root.join("libs"));
 
         // Validate per-repo overrides reference known forges.
         for (key, ov) in &fc.repo {
@@ -342,6 +375,21 @@ impl Config {
             }
             if let Some(bs) = &ov.build_system {
                 crate::manifest::BuildSystem::parse(bs)?;
+            }
+        }
+
+        // Validate per-dependency overrides: `source` must parse as a
+        // spec; `ref` requires `source`.
+        for (key, ov) in &fc.dep {
+            if let Some(s) = &ov.source {
+                crate::spec::PkgSpec::parse(s).map_err(|e| {
+                    GitfullError::Config(format!("dep.{key}: invalid source `{s}` ({e})"))
+                })?;
+            }
+            if ov.git_ref.is_some() && ov.source.is_none() {
+                return Err(GitfullError::Config(format!(
+                    "dep.{key}: `ref` requires `source`"
+                )));
             }
         }
 
@@ -361,8 +409,10 @@ impl Config {
                 toolchains_dir,
                 cache_dir,
                 logs_dir,
+                libs_dir,
                 forges,
                 repos: fc.repo,
+                deps: fc.dep,
                 toolchain: fc.toolchain,
                 policy: fc.policy,
                 clone: fc.clone,
@@ -376,6 +426,20 @@ impl Config {
         self.repos.get(&format!("{owner}/{repo}"))
     }
 
+    /// Per-dependency override for a manifest-declared dependency name.
+    /// Exact key first, then case-insensitive (manifest names arrive in
+    /// their native case — `find_package(ZLIB)` vs `[dep.zlib]`).
+    pub fn dep_override_for(&self, name: &str) -> Option<&DepOverride> {
+        if let Some(ov) = self.deps.get(name) {
+            return Some(ov);
+        }
+        let lower = name.to_ascii_lowercase();
+        self.deps
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .map(|(_, v)| v)
+    }
+
     /// Ensure the mutable state root exists (called by mutating commands
     /// only — read-only commands never create anything).
     pub fn ensure_root(&self) -> Result<()> {
@@ -385,6 +449,7 @@ impl Config {
             &self.toolchains_dir,
             &self.cache_dir,
             &self.logs_dir,
+            &self.libs_dir,
         ] {
             std::fs::create_dir_all(d)?;
         }

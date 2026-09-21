@@ -8,15 +8,23 @@
 //!    [`crate::search`]);
 //! 2. create the app sandbox; clone with the **live progress UI**;
 //! 3. auto-detect the build system (no extra files needed in the repo);
-//! 4. walk package dependencies recursively (cycle-safe), cloning and
-//!    building each inside *this* sandbox under `deps/`;
+//! 4. **parse the build system's own dependency declarations**
+//!    ([`crate::depgraph`]: meson `dependency()`/wraps, cmake
+//!    `find_package()`/`find_library()`, Cargo.toml, configure.ac,
+//!    Makefile pkg-config calls) and walk the full dependency graph
+//!    cycle-safely, cloning and building every dependency inside *this*
+//!    sandbox under `deps/` — each fetch shows the same live progress
+//!    UI. Resolved dependencies are cached in the shared library cache
+//!    `<root>/libs/` ([`crate::libcache`]) so a second app needing the
+//!    same library reuses the build;
 //! 5. select **shared** toolchains from `<root>/toolchains/` — anything
 //!    missing is **auto-provisioned from source** by gitfull itself
 //!    ([`crate::bootstrap::ensure_components`]): the seed GCC uses the
 //!    host compiler exactly once, everything after that is built with
 //!    toolchain-managed tools. A host package manager is never invoked
 //!    (structurally impossible — see [`crate::gitproc`]);
-//! 6. build (all commands through the exec chokepoint, hermetic env);
+//! 6. build dependencies leaves-first, then the app (all commands through
+//!    the exec chokepoint, hermetic env);
 //! 7. stage + collect final binaries;
 //! 8. **the single sandbox-escape path** — [`install_binaries`] copies
 //!    exactly those binaries into the bin dir, hashed + audited;
@@ -34,10 +42,12 @@ use std::path::{Path, PathBuf};
 
 use crate::bootstrap;
 use crate::config::Config;
+use crate::depgraph::{self, DeclaredDep, DeclaredDeps, WrapDep};
 use crate::error::{GitfullError, Result};
 use crate::gitproc::{self, authed_url, ExecClass, ExecCtx, RemoteUrl};
+use crate::libcache::{self, LibCache, LibMeta};
 use crate::progress::ProgressUi;
-use crate::resolver::{detect_cycle, resolve_repo, ResolvedRepo};
+use crate::resolver::{resolve_repo, ResolvedRepo};
 use crate::sandbox::Sandbox;
 use crate::search;
 use crate::sha256::sha256_file;
@@ -70,6 +80,22 @@ pub struct MetaBin {
     pub dest: String,
 }
 
+/// One shared-library-cache entry an install used (discovered via
+/// [`crate::depgraph`] and built from source, or reused from a previous
+/// install). Entries are shared between apps like toolchain components;
+/// `gitfull remove` never deletes them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetaLib {
+    /// Cache entry key (`<slug>-<hash>`).
+    pub key: String,
+    /// Name the dependency was declared as in the manifest.
+    pub name: String,
+    /// Source the library was fetched from.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallRecord {
     pub name: String,
@@ -84,6 +110,8 @@ pub struct InstallRecord {
     pub build_system: String,
     pub toolchains: Vec<MetaToolchain>,
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libs: Vec<MetaLib>,
     pub bins: Vec<MetaBin>,
     pub installed_at: u64,
 }
@@ -533,6 +561,576 @@ pub fn install_binaries(
 }
 
 // ---------------------------------------------------------------------------
+// dependency-graph discovery + provisioning (depgraph.rs + libcache.rs)
+// ---------------------------------------------------------------------------
+
+/// The live progress UI used for **every** clone — the main repo,
+/// each dependency source, and toolchain components. One mechanism,
+/// one look (fill / rate / ETA / MB), so no fetch is ever invisible.
+pub(crate) fn clone_progress(cfg: &Config) -> ProgressUi {
+    ProgressUi::new(
+        util::is_tty(2),
+        util::term_width(),
+        match cfg.color {
+            crate::config::ColorChoice::Always => true,
+            crate::config::ColorChoice::Never => false,
+            crate::config::ColorChoice::Auto => util::colors_enabled(false, false),
+        },
+    )
+}
+
+/// How one dependency's source is fetched.
+#[derive(Debug, Clone)]
+enum Fetch {
+    Git {
+        url: RemoteUrl,
+        git_ref: Option<String>,
+    },
+    Local {
+        path: PathBuf,
+    },
+    /// meson `[wrap-file]`: source tarball (+ optional patch).
+    Tarball {
+        url: String,
+        patch_url: Option<String>,
+    },
+}
+
+impl Fetch {
+    fn label(&self) -> String {
+        match self {
+            Fetch::Git { url, .. } => url.clean.clone(),
+            Fetch::Local { path } => path.display().to_string(),
+            Fetch::Tarball { url, .. } => url.clone(),
+        }
+    }
+}
+
+/// What the walk should do with one queued dependency source.
+enum DepSpec {
+    /// A concrete package spec (`[repo] packages`, `[dep.<name>] source`,
+    /// or a name resolved through ranked forge search).
+    Package(PkgSpec),
+    /// meson `[wrap-git]` subproject (clone the pinned URL directly).
+    WrapGit(WrapDep),
+    /// meson `[wrap-file]` subproject (source tarball).
+    WrapFile(WrapDep),
+}
+
+/// One node of the per-install dependency graph. Node 0 is the app
+/// itself; every other node is a dependency discovered from build
+/// manifests (or declared via `[repo] packages`).
+struct DepNode {
+    key: String,
+    /// Dedupe identity: clone URL + ref, local path, or tarball URL.
+    identity: String,
+    /// Deterministic `<root>/libs/` cache key for this source.
+    cache_key: String,
+    /// Name the dependency was declared as in a manifest, if any.
+    declared: Option<String>,
+    /// Normalized declared name (cache-provides matching).
+    name_norm: Option<String>,
+    sandbox: Sandbox,
+    resolved: ResolvedRepo,
+    parent: usize,
+    /// Direct dependency nodes (children = things this node needs).
+    children: Vec<usize>,
+    /// Shared-cache entries reused by *name* while planning this node.
+    lib_hits: Vec<PathBuf>,
+    fetch: Fetch,
+    /// Final install location: the lib-cache entry dir (deps) — set
+    /// after the node is built or found cached.
+    prefix: Option<PathBuf>,
+    commit: Option<String>,
+}
+
+/// What planning one declared dependency concluded.
+enum DepPlan {
+    /// Nothing to fetch (reason printed for the user).
+    Satisfied,
+    /// Reuse an existing shared-cache entry by provided name.
+    CacheHit(PathBuf),
+    /// Fetch + build from this source.
+    Fetch(DepSpec),
+}
+
+/// Plan one manifest-declared dependency through the resolution layers:
+///
+/// 1. cargo registry deps — the cargo resolver fetches them into the
+///    app's own sandbox at build time (isolation-compliant by design);
+/// 2. user `[dep.<name>]` override (`skip`, or a pinned `source`);
+/// 3. meson wraps (the manifest's own pin files — git/file);
+/// 4. vendored subprojects (checked-in trees under `subprojects/`);
+/// 5. the shared library cache, matched by provided names;
+/// 6. ranked forge search over all configured forges (the generic
+///    name→repo mapping — no name tables anywhere in the code).
+fn plan_declared_dep(
+    cfg: &Config,
+    ctx: &ExecCtx,
+    cache: &LibCache,
+    declared: &DeclaredDeps,
+    d: &DeclaredDep,
+) -> Result<DepPlan> {
+    if d.kind == crate::depgraph::DepKind::CrateRegistry {
+        println!(
+            "gitfull: dep `{}`: cargo registry dependency — cargo itself \
+             fetches it into the app's sandbox at build time",
+            d.name
+        );
+        return Ok(DepPlan::Satisfied);
+    }
+    if let Some(ov) = cfg.dep_override_for(&d.name) {
+        if ov.skip {
+            println!("gitfull: dep `{}`: skipped ([dep.{}] skip = true)", d.name, d.name);
+            return Ok(DepPlan::Satisfied);
+        }
+        if let Some(src) = &ov.source {
+            let mut spec = PkgSpec::parse(src)?;
+            if spec.git_ref.is_none() {
+                spec.git_ref = ov.git_ref.clone();
+            }
+            println!(
+                "gitfull: dep `{}`: pinned via [dep.{}] -> {}",
+                d.name,
+                d.name,
+                spec.key()
+            );
+            // identity-level cache check BEFORE fetching: this exact
+            // pinned source may already have been built by an earlier
+            // install — then nothing is cloned at all
+            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
+        }
+    }
+    // meson wraps: the manifest's own pin for this name wins over search
+    if let Some(w) = declared
+        .wraps
+        .iter()
+        .find(|w| w.name.to_ascii_lowercase() == d.name_norm || w.provides.iter().any(|p| p.to_ascii_lowercase() == d.name_norm))
+    {
+        if let Some(git) = &w.git {
+            println!(
+                "gitfull: dep `{}`: meson wrap (git) -> {} ({})",
+                d.name, git.0, git.1
+            );
+            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::WrapGit(w.clone()));
+        }
+        if let Some(file) = &w.file {
+            println!(
+                "gitfull: dep `{}`: meson wrap (file) -> {}",
+                d.name, file.0
+            );
+            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::WrapFile(w.clone()));
+        }
+    }
+    // vendored subproject trees are used in-tree; fetching anything
+    // for them would be wrong
+    if declared
+        .vendored
+        .iter()
+        .any(|v| v.to_ascii_lowercase() == d.name_norm)
+    {
+        println!(
+            "gitfull: dep `{}`: vendored subproject in-tree — nothing to fetch",
+            d.name
+        );
+        return Ok(DepPlan::Satisfied);
+    }
+    // shared library cache: reuse a build a previous install produced
+    if let Some((key, dir)) = cache.find_providing(&d.name_norm) {
+        println!(
+            "gitfull: dep `{}`: shared lib cache hit (entry {}, built by an \
+             earlier install — no rebuild)",
+            d.name, key
+        );
+        return Ok(DepPlan::CacheHit(dir));
+    }
+    // generic resolution: ranked forge search across all configured forges
+    let spec = search::resolve_dep_name(cfg, ctx, &d.name)?;
+    Ok(DepPlan::Fetch(DepSpec::Package(spec)))
+}
+
+/// Resolve a *pinned* dependency source (user `[dep.<name>]` override or
+/// meson wrap) down to its fetch identity and check the shared cache at
+/// the **identity** level: if this exact source (URL+ref / path /
+/// tarball URL) was already built by an earlier install, reuse that
+/// entry outright — no clone, no rebuild. Only a miss falls through to
+/// a fetch. The cache key here matches the one the walk assigns when a
+/// fetched node is registered (`identity_key(name_norm, identity)`).
+fn identity_or_fetch(
+    cfg: &Config,
+    cache: &LibCache,
+    name_norm: &str,
+    spec: DepSpec,
+) -> Result<DepPlan> {
+    let planned = plan_dep_fetch(cfg, &spec)?;
+    let key = LibCache::identity_key(name_norm, &planned.identity);
+    if cache.entry_meta(&key).is_some() {
+        println!(
+            "gitfull: dep `{}`: this exact source is already built (shared lib \
+             cache entry {key}) — reusing, nothing fetched",
+            name_norm
+        );
+        return Ok(DepPlan::CacheHit(cache.entry_dir(&key)));
+    }
+    // the same physical source registered by an earlier install under
+    // an alias name (identity reconstructs from the entry's provenance)
+    if let Some((alias_key, dir)) = cache.find_by_identity(&planned.identity) {
+        println!(
+            "gitfull: dep `{}`: this exact source is already built (entry {alias_key}, \
+             registered under another name) — reusing, nothing fetched",
+            name_norm
+        );
+        return Ok(DepPlan::CacheHit(dir));
+    }
+    Ok(DepPlan::Fetch(spec))
+}
+
+/// Print the dependency-scan summary for one source tree.
+fn print_dep_scan(declared: &DeclaredDeps) {
+    let req = declared.required_names();
+    if req.is_empty() && declared.wraps.is_empty() && declared.optional.is_empty() {
+        println!("gitfull: no declared library dependencies found");
+        return;
+    }
+    for d in req {
+        println!(
+            "gitfull:   dep {} {}({}; {})",
+            d.name,
+            d.version
+                .as_deref()
+                .map(|v| format!("{v} "))
+                .unwrap_or_default(),
+            d.kind.label(),
+            d.origin
+        );
+    }
+    for d in &declared.optional {
+        println!(
+            "gitfull:   dep {} ({}; optional per the manifest — reported, \
+             not provisioned)",
+            d.name, d.kind.label()
+        );
+    }
+}
+
+/// Fetch one dependency's source into its sandbox — with the same live
+/// progress UI the main repo clone uses.
+fn fetch_dep_source(
+    cfg: &Config,
+    fetch_ctx: &ExecCtx,
+    node_sb: &Sandbox,
+    fetch: &Fetch,
+) -> Result<Option<String>> {
+    match fetch {
+        Fetch::Git { url, git_ref } => {
+            println!("gitfull: cloning {}", url.clean);
+            let mut ui = clone_progress(cfg);
+            gitproc::git_clone(
+                fetch_ctx,
+                url,
+                &node_sb.src(),
+                git_ref.as_deref(),
+                &cfg.clone,
+                &cfg.host_tool_path,
+                &node_sb.env(),
+                Some(&mut ui),
+            )?;
+            let commit =
+                gitproc::git_rev_parse_head(fetch_ctx, &node_sb.src(), &cfg.host_tool_path, &node_sb.env())
+                    .ok();
+            ui.finish(&format!(
+                "gitfull: cloned {} ({})",
+                url.clean,
+                commit.as_deref().unwrap_or("unknown commit")
+            ));
+            Ok(commit)
+        }
+        Fetch::Local { path } => {
+            println!("gitfull: local source {}", path.display());
+            copy_tree(path, &node_sb.src())?;
+            Ok(None)
+        }
+        Fetch::Tarball { url, patch_url } => {
+            // [wrap-file]: download the pinned tarball, extract (lifting a
+            // single top-level directory), optionally apply the wrap patch
+            let digest = crate::sha256::sha256_hex(url.as_bytes());
+            let name = util::sanitize_component(&digest[..16.min(digest.len())]);
+            let tarball = cfg.cache_dir.join(format!("dep-{name}.tar"));
+            println!("gitfull: downloading {url}");
+            gitproc::curl_download(fetch_ctx, url, &tarball, &cfg.host_tool_path)?;
+            let extract_dir = node_sb.dir.join(".extract");
+            if extract_dir.exists() {
+                fs::remove_dir_all(&extract_dir)?;
+            }
+            fs::create_dir_all(&extract_dir)?;
+            gitproc::run(
+                fetch_ctx,
+                &[
+                    "tar".into(),
+                    "-xf".into(),
+                    tarball.display().to_string(),
+                    "-C".into(),
+                    extract_dir.display().to_string(),
+                ],
+                ExecClass::HostUtility,
+                Path::new("."),
+                &[("PATH".into(), cfg.host_tool_path.clone()), ("LC_ALL".into(), "C".into())],
+                None,
+            )?;
+            // lift a single top-level dir (libfoo-1.2/...) into src/
+            let entries: Vec<_> = fs::read_dir(&extract_dir)?.flatten().collect();
+            if entries.len() == 1 && entries[0].path().is_dir() {
+                for e in fs::read_dir(entries[0].path())?.flatten() {
+                    let dest = node_sb.src().join(e.file_name());
+                    fs::rename(e.path(), &dest)?;
+                }
+            } else {
+                for e in entries {
+                    let dest = node_sb.src().join(e.file_name());
+                    fs::rename(e.path(), &dest)?;
+                }
+            }
+            let _ = fs::remove_dir_all(&extract_dir);
+            if let Some(pu) = patch_url {
+                let patch_file = cfg.cache_dir.join(format!("dep-{name}.patch"));
+                println!("gitfull: downloading wrap patch {pu}");
+                gitproc::curl_download(fetch_ctx, pu, &patch_file, &cfg.host_tool_path)?;
+                gitproc::run(
+                    fetch_ctx,
+                    &[
+                        "patch".into(),
+                        "-p1".into(),
+                        "-i".into(),
+                        patch_file.display().to_string(),
+                    ],
+                    ExecClass::HostUtility,
+                    &node_sb.src(),
+                    &[("PATH".into(), cfg.host_tool_path.clone()), ("LC_ALL".into(), "C".into())],
+                    None,
+                )?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// True if `ancestor_idx` is on the parent chain of `of_idx`.
+fn is_ancestor(nodes: &[DepNode], ancestor_idx: usize, of_idx: usize) -> bool {
+    let mut cur = of_idx;
+    loop {
+        if cur == ancestor_idx {
+            return true;
+        }
+        let p = nodes[cur].parent;
+        if p == cur {
+            return false;
+        }
+        cur = p;
+    }
+}
+
+/// A queued dependency edge (parent node index + how to fetch it).
+struct QueuedDep {
+    spec: DepSpec,
+    parent: usize,
+    /// Manifest-declared name (display) for this dependency, if any.
+    declared: Option<String>,
+    name_norm: Option<String>,
+    /// Name component of the shared-cache key (declared name or repo).
+    cache_name: String,
+}
+
+/// A `DepSpec` resolved down to a concrete fetch + identity.
+struct PlannedFetch {
+    fetch: Fetch,
+    key: String,
+    identity: String,
+    sandbox_name: String,
+    /// `(owner, repo)` when forge-resolved (for `[repo]` overrides).
+    owner_repo: Option<(String, String)>,
+}
+
+fn plan_dep_fetch(cfg: &Config, spec: &DepSpec) -> Result<PlannedFetch> {
+    match spec {
+        DepSpec::Package(p) => match resolve_source(cfg, p)? {
+            ResolvedSource::Git {
+                forge_name,
+                owner,
+                repo,
+                url,
+                git_ref,
+            } => {
+                let identity =
+                    format!("{}|{}", url.clean, git_ref.clone().unwrap_or_default());
+                Ok(PlannedFetch {
+                    fetch: Fetch::Git { url, git_ref },
+                    key: p.key(),
+                    identity,
+                    sandbox_name: Sandbox::name_for(&forge_name, &owner, &repo),
+                    owner_repo: Some((owner, repo)),
+                })
+            }
+            ResolvedSource::Local(path) => {
+                let fname = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "local".into());
+                let identity = path.display().to_string();
+                Ok(PlannedFetch {
+                    fetch: Fetch::Local { path },
+                    key: p.key(),
+                    identity,
+                    sandbox_name: util::sanitize_component(&fname),
+                    owner_repo: None,
+                })
+            }
+        },
+        DepSpec::WrapGit(w) => {
+            let (url_s, rev) = w
+                .git
+                .clone()
+                .expect("internal: WrapGit queued without a url");
+            let url = authed_url(&url_s, None);
+            let identity = format!("{url_s}|{rev}");
+            Ok(PlannedFetch {
+                fetch: Fetch::Git {
+                    url,
+                    git_ref: Some(rev),
+                },
+                key: format!("wrap:{}", w.name),
+                identity,
+                sandbox_name: format!("wrap-{}", util::sanitize_component(&w.name)),
+                owner_repo: None,
+            })
+        }
+        DepSpec::WrapFile(w) => {
+            let (url_s, patch) = w
+                .file
+                .clone()
+                .expect("internal: WrapFile queued without a url");
+            Ok(PlannedFetch {
+                fetch: Fetch::Tarball {
+                    url: url_s.clone(),
+                    patch_url: patch,
+                },
+                key: format!("wrap:{}", w.name),
+                identity: url_s,
+                sandbox_name: format!("wrap-{}", util::sanitize_component(&w.name)),
+                owner_repo: None,
+            })
+        }
+    }
+}
+
+/// Plan every declared dependency of one scanned tree: adds fetches to
+/// the walk queue, returns shared-cache hits as `(name, dir)` pairs.
+///
+/// Wraps that no `dependency()` call references are still fetched — the
+/// same policy `meson subprojects download` uses: a wrap file is the
+/// project's own pin, and honoring it can only over-provide, never
+/// under-provide. (Vendored in-tree subprojects are excluded here — they
+/// need no fetch.)
+fn plan_scan(
+    cfg: &Config,
+    ctx: &ExecCtx,
+    cache: &LibCache,
+    scan: &depgraph::DeclaredDeps,
+    parent: usize,
+    queue: &mut VecDeque<QueuedDep>,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut hits = Vec::new();
+    for d in scan
+        .required
+        .iter()
+        .filter(|d| d.kind != crate::depgraph::DepKind::CrateRegistry)
+    {
+        match plan_declared_dep(cfg, ctx, cache, scan, d)? {
+            DepPlan::Satisfied => {}
+            DepPlan::CacheHit(dir) => {
+                // the hit entry AND its link closure (the entries it was
+                // built against) must all be linkable by the dependent
+                let key = dir
+                    .file_name()
+                    .map(|k| k.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                for cdir in cache.closure_dirs(&key) {
+                    if hits.iter().any(|(_, d)| d == &cdir) {
+                        continue;
+                    }
+                    let name = cache
+                        .entry_meta(
+                            &cdir
+                                .file_name()
+                                .map(|k| k.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                        )
+                        .map(|m| m.name)
+                        .unwrap_or_else(|| d.name.clone());
+                    hits.push((name, cdir));
+                }
+            }
+            DepPlan::Fetch(spec) => queue.push_back(QueuedDep {
+                spec,
+                parent,
+                declared: Some(d.name.clone()),
+                name_norm: Some(d.name_norm.clone()),
+                cache_name: d.name_norm.clone(),
+            }),
+        }
+    }
+    for w in &scan.wraps {
+        let spec = if w.git.is_some() {
+            DepSpec::WrapGit(w.clone())
+        } else {
+            DepSpec::WrapFile(w.clone())
+        };
+        println!(
+            "gitfull: dep `{}`: meson wrap pin {} — honoring the project's own \
+             subproject file",
+            w.name,
+            w.origin
+        );
+        queue.push_back(QueuedDep {
+            spec,
+            parent,
+            declared: Some(w.name.clone()),
+            name_norm: Some(w.name.to_ascii_lowercase()),
+            cache_name: w.name.to_ascii_lowercase(),
+        });
+    }
+    Ok(hits)
+}
+
+/// The link-time prefix list for building node `idx`: for every built
+/// child (each ends up as a shared-cache entry) the FULL closure of
+/// that entry — the entry itself plus every entry it was built against
+/// — plus this node's own plan-time cache hits. This is what lets a
+/// *reused* static library link: `libfoo.a` members referencing
+/// `libbar.a` symbols need `libbar` on the line even though this
+/// install never fetched it, and the build system's own `.pc`
+/// `Requires:` chain only resolves when every closure member's
+/// pkgconfig dir is on `PKG_CONFIG_PATH`.
+fn link_prefixes(cache: &LibCache, nodes: &[DepNode], idx: usize) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |dir: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    };
+    for &c in &nodes[idx].children {
+        if nodes[c].prefix.is_some() {
+            for dir in cache.closure_dirs(&nodes[c].cache_key) {
+                push(dir, &mut out);
+            }
+        }
+    }
+    for dir in nodes[idx].lib_hits.iter().cloned() {
+        push(dir, &mut out);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // install
 // ---------------------------------------------------------------------------
 
@@ -639,107 +1237,141 @@ pub fn install(
         resolved.build.label()
     );
 
-    // ---- dependency walk (inside this sandbox) ------------------------------
-    struct Dep {
-        sandbox: Sandbox,
-        resolved: ResolvedRepo,
-        url: String,
-    }
-    let mut deps: Vec<Dep> = Vec::new();
-    let mut visited: BTreeSet<String> = BTreeSet::from([key.clone()]);
-    let mut chain: Vec<String> = vec![key.clone()];
-    let mut queue: VecDeque<(PkgSpec, String)> = resolved
+    // ---- dependency-graph discovery (the repo's own manifests) -------------
+    let libcache = LibCache::new(cfg.libs_dir.clone());
+    println!(
+        "gitfull: scanning {} manifests for declared dependencies \
+         (discovery parses the project's own files — generic across repos)",
+        resolved.build.label()
+    );
+    let declared = depgraph::scan(&sb.src(), resolved.build)?;
+    print_dep_scan(&declared);
+
+    // ---- dependency graph walk (BFS, cycle-safe) ---------------------------
+    let app_identity = match &source {
+        ResolvedSource::Git { url, git_ref, .. } => {
+            format!("{}|{}", url.clean, git_ref.clone().unwrap_or_default())
+        }
+        ResolvedSource::Local(p) => p.display().to_string(),
+    };
+    // node 0 = the app itself (never registered into the lib cache)
+    let mut nodes: Vec<DepNode> = vec![DepNode {
+        key: key.clone(),
+        identity: app_identity.clone(),
+        cache_key: String::new(),
+        declared: None,
+        name_norm: None,
+        sandbox: Sandbox { dir: sb.dir.clone() },
+        resolved: resolved.clone(),
+        parent: 0,
+        children: Vec::new(),
+        lib_hits: Vec::new(),
+        fetch: Fetch::Local { path: PathBuf::new() },
+        prefix: None,
+        commit: None,
+    }];
+    let mut visited: BTreeMap<String, usize> = BTreeMap::from([(app_identity, 0usize)]);
+    let mut queue: VecDeque<QueuedDep> = resolved
         .packages
         .iter()
-        .map(|p| (p.clone(), key.clone()))
+        .map(|p| QueuedDep {
+            spec: DepSpec::Package(p.clone()),
+            parent: 0,
+            declared: None,
+            name_norm: None,
+            cache_name: spec_repo(p),
+        })
         .collect();
+    let app_hits = plan_scan(cfg, &fetch_ctx, &libcache, &declared, 0, &mut queue)?;
+    nodes[0].lib_hits = app_hits.iter().map(|(_, d)| d.clone()).collect();
 
-    while let Some((dep_spec, parent)) = queue.pop_front() {
-        let dep_source = resolve_source(cfg, &dep_spec)?;
-        let (dep_forge, dep_owner, dep_repo, dep_name, dep_url) = match &dep_source {
-            ResolvedSource::Git {
-                forge_name,
-                owner,
-                repo,
-                url,
-                ..
-            } => (
-                forge_name.clone(),
-                owner.clone(),
-                repo.clone(),
-                Sandbox::name_for(forge_name, owner, repo),
-                url.clean.clone(),
-            ),
-            ResolvedSource::Local(p) => (
-                "local".to_string(),
-                String::new(),
-                p.file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                util::sanitize_component(
-                    &p.file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "local".into()),
-                ),
-                p.display().to_string(),
-            ),
-        };
-        let dep_key = dep_spec.key();
-        if visited.contains(&dep_key) {
+    while let Some(q) = queue.pop_front() {
+        let planned = plan_dep_fetch(cfg, &q.spec)?;
+        if planned.identity == nodes[q.parent].identity {
+            println!(
+                "gitfull: note: `{}` resolves to the same source as its parent — \
+                 skipping (no self-dependency)",
+                planned.key
+            );
             continue;
         }
-        if let Some(cycle) = detect_cycle(&chain, &dep_key) {
-            return Err(GitfullError::Unsupported(format!(
-                "dependency cycle: {cycle}"
-            )));
+        if let Some(&existing) = visited.get(&planned.identity) {
+            // a back-edge onto an ancestor is a cycle; an edge onto an
+            // already-visited non-ancestor is a diamond (dedup)
+            if is_ancestor(&nodes, existing, q.parent) {
+                let mut path = vec![nodes[existing].key.clone()];
+                let mut cur = q.parent;
+                while cur != existing {
+                    path.push(nodes[cur].key.clone());
+                    cur = nodes[cur].parent;
+                }
+                path.push(nodes[existing].key.clone());
+                return Err(GitfullError::Unsupported(format!(
+                    "dependency cycle: {}",
+                    path.join(" -> ")
+                )));
+            }
+            nodes[q.parent].children.push(existing);
+            continue;
         }
-        println!("gitfull: dependency {dep_key} (required by {parent})");
+        println!(
+            "gitfull: dependency {} (required by {})",
+            planned.key, nodes[q.parent].key
+        );
 
-        let depsb = Sandbox::for_app(&sb.deps(), &dep_name);
+        // sandbox name is unique per identity: base name + key digest
+        let digest = LibCache::identity_key(&q.cache_name, &planned.identity);
+        let short = digest.rsplit('-').next().unwrap_or("x").to_string();
+        let sandbox_name = format!("{}-{short}", planned.sandbox_name);
+        let depsb = Sandbox::for_app(&sb.deps(), &sandbox_name);
         if depsb.dir.exists() {
             fs::remove_dir_all(&depsb.dir)?;
         }
         depsb.create()?;
-        match &dep_source {
-            ResolvedSource::Git { url, git_ref, .. } => {
-                gitproc::git_clone(
-                    &fetch_ctx,
-                    url,
-                    &depsb.src(),
-                    git_ref.as_deref(),
-                    &cfg.clone,
-                    &cfg.host_tool_path,
-                    &depsb.env(),
-                    None,
-                )?;
-            }
-            ResolvedSource::Local(p) => {
-                copy_tree(p, &depsb.src())?;
-            }
+        let commit = fetch_dep_source(cfg, &fetch_ctx, &depsb, &planned.fetch)?;
+        let dep_ov = planned
+            .owner_repo
+            .as_ref()
+            .and_then(|(o, r)| cfg.repo_override_for(o, r).cloned());
+        let dep_resolved = resolve_repo(&depsb.src(), &planned.key, dep_ov.as_ref())?;
+
+        // discover THIS dependency's own declared dependencies (the walk
+        // is transitive — same generic parsers, same resolution layers)
+        let dep_scan = depgraph::scan(&depsb.src(), dep_resolved.build)?;
+        let node_idx = nodes.len();
+        let dep_hits = plan_scan(cfg, &fetch_ctx, &libcache, &dep_scan, node_idx, &mut queue)?;
+        for p in &dep_resolved.packages {
+            queue.push_back(QueuedDep {
+                spec: DepSpec::Package(p.clone()),
+                parent: node_idx,
+                declared: None,
+                name_norm: None,
+                cache_name: spec_repo(p),
+            });
         }
-        let dep_ov = cfg.repo_override_for(&dep_owner, &dep_repo).cloned();
-        let dep_resolved = resolve_repo(&depsb.src(), &dep_key, dep_ov.as_ref())?;
-        queue.extend(
-            dep_resolved
-                .packages
-                .iter()
-                .map(|p| (p.clone(), dep_key.clone()))
-                .collect::<Vec<_>>(),
-        );
-        visited.insert(dep_key.clone());
-        chain.push(dep_key.clone());
-        let _ = (dep_forge, dep_repo);
-        deps.push(Dep {
+        nodes.push(DepNode {
+            key: planned.key.clone(),
+            identity: planned.identity.clone(),
+            cache_key: digest,
+            declared: q.declared.clone(),
+            name_norm: q.name_norm.clone(),
             sandbox: depsb,
             resolved: dep_resolved,
-            url: dep_url,
+            parent: q.parent,
+            children: Vec::new(),
+            lib_hits: dep_hits.into_iter().map(|(_, d)| d).collect(),
+            fetch: planned.fetch.clone(),
+            prefix: None,
+            commit,
         });
+        visited.insert(planned.identity.clone(), node_idx);
+        nodes[q.parent].children.push(node_idx);
     }
 
     // ---- merged toolchain needs ---------------------------------------------
     let mut needs: BTreeMap<String, crate::resolver::Constraint> = resolved.toolchains.clone();
-    for d in &deps {
-        for (comp, c) in &d.resolved.toolchains {
+    for n in nodes.iter().skip(1) {
+        for (comp, c) in &n.resolved.toolchains {
             let merged = needs
                 .get(comp)
                 .map(|e| e.merge(c))
@@ -821,12 +1453,25 @@ pub fn install(
             resolved.build.label(),
             build_commands(resolved.build, &sb, cfg.jobs).len()
         );
-        for d in &deps {
+        for n in nodes.iter().skip(1) {
             println!(
-                "  dep:     {} [{}] from {}",
-                d.resolved.key,
-                d.resolved.build.label(),
-                d.url
+                "  dep:     {} [{}] from {}{}",
+                n.key,
+                n.resolved.build.label(),
+                n.fetch.label(),
+                if libcache.entry_meta(&n.cache_key).is_some()
+                    || libcache.find_by_identity(&n.identity).is_some()
+                {
+                    " (shared-cache hit — would NOT rebuild)"
+                } else {
+                    ""
+                }
+            );
+        }
+        for dir in &nodes[0].lib_hits {
+            println!(
+                "  lib:     shared-cache entry {} (already built — reuse)",
+                dir.display()
             );
         }
         println!("  install: final binaries -> {}", cfg.bin_dir.display());
@@ -834,9 +1479,37 @@ pub fn install(
         return Ok(None);
     }
 
-    // ---- build dependencies, then the app ------------------------------------
-    let dep_prefixes: Vec<PathBuf> = deps.iter().map(|d| d.sandbox.prefix()).collect();
+    // ---- topological build order (dependencies before dependents) ----------
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, n) in nodes.iter().enumerate() {
+        for &c in &n.children {
+            dependents[c].push(i);
+        }
+    }
+    let mut pending: Vec<usize> = nodes.iter().map(|n| n.children.len()).collect();
+    let mut ready: Vec<usize> = (0..nodes.len()).filter(|&i| pending[i] == 0).collect();
+    let mut order: Vec<usize> = Vec::new();
+    while let Some(i) = ready.pop() {
+        order.push(i);
+        for &d in &dependents[i] {
+            pending[d] -= 1;
+            if pending[d] == 0 {
+                ready.push(d);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        let stuck: Vec<String> = (0..nodes.len())
+            .filter(|i| !order.contains(i))
+            .map(|i| nodes[i].key.clone())
+            .collect();
+        return Err(GitfullError::Unsupported(format!(
+            "dependency cycle among: {}",
+            stuck.join(" -> ")
+        )));
+    }
 
+    // ---- build dependencies (leaves first), then the app -------------------
     let tc_bins: Vec<PathBuf> = selections.values().map(|s| s.bin.clone()).collect();
     let tc_libs: Vec<PathBuf> = selections
         .values()
@@ -858,17 +1531,51 @@ pub fn install(
         ));
     }
 
-    for d in &deps {
-        println!(
-            "gitfull: building dependency {} [{}]",
-            d.resolved.key,
-            d.resolved.build.label()
+    for &idx in &order {
+        if idx == 0 {
+            continue; // the app itself builds after all dependencies
+        }
+        // identity hit: this exact source is already built and cached —
+        // the core of "a second app never rebuilds the same library".
+        // Looked up under this node's key AND by identity (an earlier
+        // install may have registered it under an alias name).
+        let identity_hit = if libcache.entry_meta(&nodes[idx].cache_key).is_some() {
+            Some(nodes[idx].cache_key.clone())
+        } else {
+            libcache
+                .find_by_identity(&nodes[idx].identity)
+                .map(|(k, _)| k)
+        };
+        if let Some(key) = identity_hit {
+            println!(
+                "gitfull: dependency {} satisfied by shared lib cache entry {} \
+                 (this exact source was built by an earlier install — no rebuild)",
+                nodes[idx].key, key
+            );
+            nodes[idx].cache_key = key;
+            nodes[idx].prefix = Some(libcache.entry_dir(&nodes[idx].cache_key));
+            continue;
+        }
+        let child_prefixes: Vec<PathBuf> = link_prefixes(&libcache, &nodes, idx);
+        let mut node_extra = extra.clone();
+        if nodes[idx].resolved.build == crate::manifest::BuildSystem::Cargo {
+            // keep cargo's target dir inside the sandbox build area —
+            // `build/target`, exactly where the binary collector looks
+            // (and never inside src/, which walk_files prunes)
+            node_extra.push((
+                "CARGO_TARGET_DIR".into(),
+                nodes[idx].sandbox.build().join("target").display().to_string(),
+            ));
+        }
+        let dep_env = nodes[idx].sandbox.build_env(
+            &tc_bins,
+            &tc_libs,
+            &child_prefixes,
+            &cfg.host_tool_path,
+            &node_extra,
         );
-        let dep_env = d
-            .sandbox
-            .build_env(&tc_bins, &tc_libs, &[], &cfg.host_tool_path, &extra);
-        let jobs = d.resolved.jobs.unwrap_or(cfg.jobs);
-        let steps = build_commands(d.resolved.build, &d.sandbox, jobs);
+        let jobs = nodes[idx].resolved.jobs.unwrap_or(cfg.jobs);
+        let steps = build_commands(nodes[idx].resolved.build, &nodes[idx].sandbox, jobs);
         let dep_ctx = ExecCtx {
             resolve_path: dep_env
                 .iter()
@@ -877,9 +1584,70 @@ pub fn install(
                 .unwrap_or_else(|| cfg.host_tool_path.clone()),
             ..base_ctx.clone()
         };
-        run_build(&dep_ctx, &d.sandbox, &steps, &dep_env, opts.verbose)?;
-        promote_stage(&stage_root(&d.sandbox), &d.sandbox.prefix())?;
-        println!("gitfull: dependency {} built and staged", d.resolved.key);
+        println!(
+            "gitfull: building dependency {} [{}]",
+            nodes[idx].key,
+            nodes[idx].resolved.build.label()
+        );
+        run_build(&dep_ctx, &nodes[idx].sandbox, &steps, &dep_env, opts.verbose)?;
+        promote_stage(
+            &stage_root(&nodes[idx].sandbox),
+            &nodes[idx].sandbox.prefix(),
+        )?;
+
+        // register the built library in the shared cache: the install
+        // prefix moves to <root>/libs/<key>/ so every later app (and every
+        // later install) reuses it instead of rebuilding
+        let mut provides = libcache::provided_names(&nodes[idx].sandbox.prefix());
+        let display_name = nodes[idx]
+            .declared
+            .clone()
+            .unwrap_or_else(|| nodes[idx].key.clone());
+        let name_norm = nodes[idx]
+            .name_norm
+            .clone()
+            .unwrap_or_else(|| display_name.to_ascii_lowercase());
+        if !provides.contains(&name_norm) {
+            provides.push(name_norm);
+        }
+        let git_ref = match &nodes[idx].fetch {
+            Fetch::Git { git_ref, .. } => git_ref.clone(),
+            _ => None,
+        };
+        // the link closure this library was built against: children
+        // (built or reused entries) + plan-time cache hits — recorded so
+        // a later app reusing THIS entry links its closure too
+        let mut requires: Vec<String> =
+            nodes[idx].children.iter().map(|&c| nodes[c].cache_key.clone()).collect();
+        for dir in &nodes[idx].lib_hits {
+            if let Some(k) = dir.file_name().map(|k| k.to_string_lossy().to_string()) {
+                if !requires.contains(&k) {
+                    requires.push(k);
+                }
+            }
+        }
+        let meta = LibMeta {
+            name: display_name.clone(),
+            provides,
+            source: nodes[idx].fetch.label(),
+            git_ref,
+            commit: nodes[idx].commit.clone(),
+            requires,
+            built_by: "gitfull toolchain (toolchain-managed gcc)".into(),
+            date_epoch: util::epoch(),
+        };
+        let dir = libcache.register(
+            &nodes[idx].cache_key,
+            &nodes[idx].sandbox.prefix(),
+            &meta,
+        )?;
+        println!(
+            "gitfull: dependency {} built and cached: {} (provides: {})",
+            nodes[idx].key,
+            dir.display(),
+            meta.provides.join(", ")
+        );
+        nodes[idx].prefix = Some(dir);
     }
 
     println!(
@@ -887,12 +1655,21 @@ pub fn install(
         sandbox_name,
         resolved.build.label()
     );
+    let dep_prefixes: Vec<PathBuf> = link_prefixes(&libcache, &nodes, 0);
+    let mut app_extra = extra.clone();
+    if resolved.build == crate::manifest::BuildSystem::Cargo {
+        // cargo's target dir: build/target — where the collector looks
+        app_extra.push((
+            "CARGO_TARGET_DIR".into(),
+            sb.build().join("target").display().to_string(),
+        ));
+    }
     let app_env = sb.build_env(
         &tc_bins,
         &tc_libs,
         &dep_prefixes,
         &cfg.host_tool_path,
-        &extra,
+        &app_extra,
     );
     let jobs = resolved.jobs.unwrap_or(cfg.jobs);
     let steps = build_commands(resolved.build, &sb, jobs);
@@ -904,10 +1681,6 @@ pub fn install(
             .unwrap_or_else(|| cfg.host_tool_path.clone()),
         ..base_ctx.clone()
     };
-    if resolved.build == crate::manifest::BuildSystem::Cargo {
-        // cargo needs a writable target dir + registry under HOME
-        let _ = fs::create_dir_all(sb.build().join("target"));
-    }
     run_build(&app_ctx, &sb, &steps, &app_env, opts.verbose)?;
 
     // collect final binaries from the staging area BEFORE promotion
@@ -968,7 +1741,8 @@ pub fn install(
                 version: s.version.clone(),
             })
             .collect(),
-        packages: deps.iter().map(|d| d.resolved.key.clone()).collect(),
+        packages: nodes.iter().skip(1).map(|n| n.key.clone()).collect(),
+        libs: lib_record(&libcache, &nodes, &app_hits),
         bins: metas,
         installed_at: util::epoch(),
     };
@@ -988,6 +1762,40 @@ fn op_text(op: crate::resolver::CmpOp) -> &'static str {
         Lt => "<",
         Lte => "<=",
     }
+}
+
+/// The `libs` section of the install record: one entry per shared-cache
+/// library this install built or reused.
+fn lib_record(
+    cache: &LibCache,
+    nodes: &[DepNode],
+    app_hits: &[(String, PathBuf)],
+) -> Vec<MetaLib> {
+    let mut out: Vec<MetaLib> = Vec::new();
+    for n in nodes.iter().skip(1) {
+        if let Some(meta) = cache.entry_meta(&n.cache_key) {
+            out.push(MetaLib {
+                key: n.cache_key.clone(),
+                name: meta.name,
+                source: meta.source,
+                commit: meta.commit,
+            });
+        }
+    }
+    for (name, dir) in app_hits {
+        let key = dir
+            .file_name()
+            .map(|k| k.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let meta = cache.entry_meta(&key);
+        out.push(MetaLib {
+            key,
+            name: name.clone(),
+            source: meta.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
+            commit: meta.as_ref().and_then(|m| m.commit.clone()),
+        });
+    }
+    out
 }
 
 /// Simple recursive copy (used for local-path sources).
@@ -1130,6 +1938,17 @@ pub fn info(cfg: &Config, query: &str) -> Result<()> {
         );
         if !rec.packages.is_empty() {
             println!("dependencies: {}", rec.packages.join(", "));
+        }
+        if !rec.libs.is_empty() {
+            println!(
+                "libraries:   {} (shared <root>/libs cache; never removed \
+                 with the app)",
+                rec.libs
+                    .iter()
+                    .map(|l| format!("{} [{}]", l.name, l.key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         for b in &rec.bins {
             println!(

@@ -36,10 +36,12 @@ compile_error!("gitfull currently targets Linux/Unix only.");
 
 pub mod bootstrap;
 pub mod config;
+pub mod depgraph;
 pub mod error;
 pub mod forge;
 pub mod gitproc;
 pub mod json;
+pub mod libcache;
 pub mod manifest;
 pub mod planner;
 pub mod privilege;
