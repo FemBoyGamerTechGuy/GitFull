@@ -1139,3 +1139,270 @@ fn cargo_app_with_no_registry_deps_builds_and_installs() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "cargo says hi\n");
 }
+
+// ---------------------------------------------------------------------------
+// meson: multi-name fallback + component-scoped monorepo builds, live
+// ---------------------------------------------------------------------------
+
+/// Locate a program on the test runner's PATH (the `have()` helper only
+/// looks in /usr/bin and /bin — meson/ninja often live elsewhere, e.g.
+/// a pip venv).
+fn on_path(prog: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(prog))
+        .find(|p| p.is_file())
+}
+
+/// A real meson/ninja round trip of the systemd-family scenarios:
+///
+/// * the "monorepo" dependency models systemd's shape exactly — one
+///   installable component library (tag `sdclient`), a build-time
+///   generated `.pc` (tag `devel`, like libsystemd.pc), public headers
+///   (`devel`), upstream's own `alias_target('sdclient', …)` and
+///   `alias_target('devel', …)` — and a whole "suite" executable that a
+///   component-scoped build must NEVER compile or install;
+/// * the app declares the classic multi-name fallback
+///   `dependency('sd-primary-fixture', 'sd-client-fixture')`: the
+///   primary resolves nowhere, the fallback resolves through the
+///   `[dep.<name>]` pin with `build_targets`/`install_tags` scoping —
+///   and REAL meson then satisfies the very same call through pkg-config
+///   in the sandbox (proving, at meson's own level, that only ONE of
+///   the two names needs to exist).
+#[test]
+fn meson_multi_name_fallback_and_component_scoped_build() {
+    if !tools_ready() {
+        eprintln!("skipping meson e2e: base tools not present");
+        return;
+    }
+    let (Some(meson), Some(ninja)) = (on_path("meson"), on_path("ninja")) else {
+        eprintln!("skipping meson e2e: meson/ninja not on PATH");
+        return;
+    };
+
+    let fx = Fixture::new("mesonscope");
+    // meson + ninja + python join the faked shared toolchain as their own
+    // components (same pattern as the cargo test's real-cargo/rustc
+    // seeding): the implicit toolchain needs of a meson repo are then
+    // satisfied WITHOUT the (network-bound, minutes-long) automatic
+    // provisioning of real python/meson/ninja
+    for (comp, version, bin, target) in [
+        ("meson", "1.12.0", "meson", &meson),
+        ("ninja", "1.13.2", "ninja", &ninja),
+        (
+            "python",
+            "3.12.0",
+            "python3",
+            &on_path("python3").expect("python3 on PATH"),
+        ),
+    ] {
+        let bin_dir = fx
+            .root
+            .join(format!("root/toolchains/{comp}-{version}/bin"));
+        fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(target, bin_dir.join(bin)).unwrap();
+    }
+
+    // ---- the dependency: a multi-component "monorepo" ------------------
+    // install dirs are literal (`lib`, `lib/pkgconfig`) so the .pc can
+    // be ${pcfiledir}-relocatable regardless of the host's multiarch
+    // libdir default — the same trick the make fixtures' .pc files use
+    let monorepo = fx.root.join("src-sdlib");
+    fs::create_dir_all(&monorepo).unwrap();
+    fs::write(
+        monorepo.join("meson.build"),
+        r#"project('sdlib', 'c', version: '1.0.0',
+  default_options: ['default_library=static'])
+
+# the COMPONENT (systemd's libsystemd analog): tag-scoped library.
+# static like the make fixtures' libraries: the installed app then
+# carries the component's code and runs without LD_LIBRARY_PATH
+sdclient = static_library('sdclient', 'sdclient.c',
+        install : true,
+        install_tag : 'sdclient',
+        install_dir : 'lib')
+
+install_headers('sdclient.h', install_tag : 'devel')
+
+# the module's .pc — a BUILD-TIME generated file, exactly like
+# libsystemd.pc (jinja2 custom_target upstream, plain cp here). The
+# FILE is the pkg-config module name (pkg-config matches by file stem)
+pc = custom_target('sd-client-fixture.pc',
+        input : 'sd-client-fixture.pc.in',
+        output : 'sd-client-fixture.pc',
+        command : ['cp', '@INPUT@', '@OUTPUT@'],
+        install : true,
+        install_dir : 'lib/pkgconfig',
+        install_tag : 'devel')
+
+# upstream's own component alias targets (systemd's
+# alias_target('libsystemd', ...) / alias_target('devel', ...))
+alias_target('sdclient', sdclient)
+alias_target('devel', pc)
+
+# the rest of the "suite" — a scoped build must never compile this
+executable('sd-daemon', 'daemon.c', install : true)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        monorepo.join("sdclient.c"),
+        "#include \"sdclient.h\"\nint sdclient_entry(int n) { return n * 3 + 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        monorepo.join("sdclient.h"),
+        "#ifndef SDCLIENT_H\n#define SDCLIENT_H\nint sdclient_entry(int n);\n#endif\n",
+    )
+    .unwrap();
+    fs::write(
+        monorepo.join("daemon.c"),
+        "int main(void) { return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        monorepo.join("sd-client-fixture.pc.in"),
+        "libdir=${pcfiledir}/..\nincludedir=${pcfiledir}/../../include\n\n\
+         Name: sd-client-fixture\n\
+         Description: gitfull e2e scoped-build component library\n\
+         Version: 1.0.0\n\
+         Libs: -L${libdir} -lsdclient\n\
+         Cflags: -I${includedir}\n",
+    )
+    .unwrap();
+
+    // ---- the app: the classic multi-name fallback call -----------------
+    let app = fx.root.join("src-meson-app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("meson.build"),
+        r#"project('scopedapp', 'c', version: '1.0')
+
+# meson's own multi-name fallback order: the primary is expected to be
+# missing everywhere; the fallback is found through PKG_CONFIG_PATH.
+# REAL meson executes this — proving one existing name suffices.
+sd_dep = dependency('sd-primary-fixture', 'sd-client-fixture')
+
+executable('scopedhello', 'main.c', dependencies : sd_dep, install : true)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        app.join("main.c"),
+        "#include <stdio.h>\n#include \"sdclient.h\"\n\
+         int main(void) { printf(\"sd=%d\\n\", sdclient_entry(4)); return 0; }\n",
+    )
+    .unwrap();
+
+    // ---- the pin: local source + component build scoping ---------------
+    let conf = fs::read_to_string(fx.root.join("gitfull.conf")).unwrap();
+    fs::write(
+        fx.root.join("gitfull.conf"),
+        format!(
+            "{conf}\n[dep.sd-client-fixture]\nsource = \"{}\"\n\
+             build_targets = [\"sdclient\", \"devel\"]\n\
+             install_tags = \"sdclient,devel\"\n",
+            monorepo.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = fx.cfg();
+    let ctx = fx.ctx(&cfg);
+    let spec = PkgSpec::parse(&app.display().to_string()).unwrap();
+    let rec = planner::install(&cfg, &ctx, &spec, &Fixture::opts())
+        .unwrap()
+        .expect("meson scoped install should succeed");
+    assert_eq!(rec.build_system, "meson");
+
+    // the app binary was produced by REAL meson, linked against the
+    // scoped-built component through the multi-name dependency call
+    let bin = fx.root.join("bin/scopedhello");
+    assert!(bin.is_file(), "scopedhello must be collected");
+    let out = Command::new(&bin).output().unwrap();
+    assert!(out.status.success(), "linked app must run: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sd=13\n");
+
+    // ---- the scoping proofs ---------------------------------------------
+    // 1. the suite executable was NEVER compiled NOR installed: no file
+    //    whose name starts with `sd-daemon` anywhere under the install
+    //    root (build dirs would carry sd-daemon.p/ artifacts, prefixes
+    //    would carry bin/sd-daemon)
+    let mut daemon_hits = Vec::new();
+    let mut stack = vec![fx.root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("sd-daemon"))
+                .unwrap_or(false)
+            {
+                daemon_hits.push(p);
+            }
+        }
+    }
+    assert!(
+        daemon_hits.is_empty(),
+        "a component-scoped build must never compile the rest of the \
+         monorepo: {daemon_hits:?}"
+    );
+
+    // 2. exactly the component's artifacts were installed into the
+    //    shared lib cache entry: the library, its .pc, and the header
+    let mut found = (false, false, false);
+    let mut stack = vec![fx.root.join("root/libs")];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let n = p.file_name().unwrap().to_string_lossy().to_string();
+                    found.0 |= n == "libsdclient.a";
+                    found.1 |= n == "sd-client-fixture.pc";
+                    found.2 |= n == "sdclient.h";
+                }
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        (true, true, true),
+        "the component's full devel surface (library, .pc, header) must \
+         be installed into the shared cache entry"
+    );
+
+    // 3. the scoped build steps really ran (their step labels are the
+    //    log file names in the dependency sandbox)
+    let mut scoped_logs = Vec::new();
+    let mut stack = vec![fx.root.join("root/apps")];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.file_name().unwrap() == "02-build-scoped.log" {
+                    scoped_logs.push(p);
+                }
+            }
+        }
+    }
+    assert!(
+        scoped_logs.len() == 1,
+        "the dependency build must use the scoped steps: {scoped_logs:?}"
+    );
+    let log_text =
+        fs::read_to_string(scoped_logs[0].parent().unwrap().join("03-install-scoped.log"))
+            .unwrap();
+    assert!(
+        log_text.contains("--no-rebuild") && log_text.contains("--tags"),
+        "the scoped install command must be `meson install --no-rebuild \
+         --tags …` (meson's plain install target depends on `all` and \
+         would compile the whole monorepo): {log_text}"
+    );
+}

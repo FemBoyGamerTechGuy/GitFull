@@ -59,15 +59,20 @@ $ sudo gitfull install meson       # ONE command does everything
   declared library. Module names resolve **curated-mapping-first**:
   user `[dep.<name>]` pins, meson wraps, the shared library cache, then
   a built-in curated upstream map of well-known pkg-config modules
-  (GLib/GTK families, cairo, pango, harfbuzz, SDL, wayland, …) — and
-  ranked forge search is only a *flagged fallback* whose unconfirmed
-  matches are never auto-built (interactive `y` confirmation or a
-  config pin required; sibling modules of one parent repo —
-  `glib-2.0` + `gio-unix-2.0` — deduplicate to a single
-  fetch/build). Libraries are built from source with the
-  toolchain-managed compiler and cached under `<root>/libs/` so a
-  second app needing the same library never rebuilds. Discovery
-  parsing is fully generic — no per-repo name tables.
+  (GLib/GTK families, cairo, pango, harfbuzz, SDL, wayland, the
+  systemd family — `libsystemd`/`libelogind`/`libudev`, built as
+  scoped components of their monorepos, never the whole suite, …) —
+  and ranked forge search is only a *flagged fallback* whose
+  unconfirmed matches are never auto-built (interactive `y`
+  confirmation or a config pin required; sibling modules of one parent
+  repo — `glib-2.0` + `gio-unix-2.0` — deduplicate to a single
+  fetch/build). Multi-name meson declarations
+  (`dependency('libsystemd', 'libelogind')`) resolve through the chain
+  in meson's own order — whichever name has a sound source. Libraries
+  are built from source with the toolchain-managed compiler and cached
+  under `<root>/libs/` so a second app needing the same library never
+  rebuilds. Discovery parsing is fully generic — no per-repo name
+  tables.
 
 
 $ gitfull list                     # read-only: no root needed

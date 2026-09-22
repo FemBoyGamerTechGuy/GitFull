@@ -139,6 +139,8 @@ native case: `find_package(ZLIB)` vs `[dep.zlib]`).
 source = "gitlab:madler/zlib"    # any spec form: forge:owner/repo,
 ref = "develop"                  # owner/repo, a URL, or a local path
 skip = false                     # never provision this dependency
+build_targets = []               # meson only: component-scoped compile
+install_tags = "devel,libsystemd" # meson only: tagged install filter
 ```
 
 | key | type | meaning |
@@ -146,6 +148,8 @@ skip = false                     # never provision this dependency
 | `source` | string | pin where this dependency comes from — use it when ranked search picks a repo you do not want, or to point at a fork, mirror, or local checkout (validated at config load) |
 | `ref` | string | pin a branch/tag/commit; requires `source` |
 | `skip` | bool | deliberate opt-out: never provision this dependency (e.g. a project declares a dependency it does not actually need) |
+| `build_targets` | list of strings | meson dependencies only: compile ONLY these ninja targets (upstream's own component alias targets — e.g. systemd's `libsystemd`, `devel`) instead of the whole suite; overrides the curated entry's scoping for this name; empty means "compile everything" (useful with `install_tags` alone) |
+| `install_tags` | string | meson dependencies only: `meson install --tags …` filter — copy only files upstream tagged for the component (e.g. `"libsystemd,devel"`); when neither scoping key is set, the curated entry's scoping (if any) applies |
 
 ### How `[dep]` composes with curated-mapping-first resolution
 
@@ -182,6 +186,48 @@ dedicated `CloneAuth` error that says gitfull sent **no credentials**,
 and offers the two remedies: repin the `[dep.<name>]` `source` at an
 anonymously-clonable upstream, or register the host as
 `[forge.<name>]` with a `token_env` to clone it authenticated.
+
+Multi-name meson declarations (`dependency('libsystemd', 'libelogind')`)
+resolve through the chain in meson's own order — see
+docs/ARCHITECTURE.md, "Multi-name fallback". A `[dep.<name>]` pin is
+consulted at its position in the chain; to force the *fallback* name
+instead of a resolvable primary (a musl deployment wanting elogind),
+pin the primary name to the fallback's source:
+
+```toml
+[dep.libsystemd]
+source = "https://github.com/elogind/elogind"
+# the built tree provides libelogind.pc; the target app's own meson
+# still resolves its dependency('libsystemd', 'libelogind') call —
+# the first name found wins, and the fallback is what got built
+```
+
+### Component-scoped builds (`build_targets` / `install_tags`)
+
+Some upstreams are multi-component monorepos — building all of
+systemd to obtain `libsystemd` would compile every daemon. The curated
+entries for the systemd family (`libsystemd`, `libelogind`, `libudev`)
+carry component scopes read from upstream's own build definitions
+(`alias_target('libsystemd', …)`, `install_tag: 'libsystemd'`/`'devel'`);
+gitfull compiles only the component's targets and installs only its
+tagged files (`meson install --no-rebuild --tags …` — the
+`--no-rebuild` is what keeps the install step from compiling the whole
+suite). The two keys above let you replace or reproduce that scoping
+for any pinned dependency, e.g. for a systemd fork:
+
+```toml
+[dep.libsystemd]
+source = "https://github.com/myorg/systemd-fork"
+build_targets = ["libsystemd", "devel"]
+install_tags = "libsystemd,devel"
+```
+
+Scoping applies to meson dependencies only (other build systems
+ignore the keys), never to the application you are installing itself,
+and — like every curated-map resolution — only inside the target
+app's sandbox: gitfull's own binary never links any of it (enforced by
+tests; see docs/ARCHITECTURE.md, "Target-app dependencies vs.
+gitfull's own binary").
 
 ### The search fallback never auto-builds
 

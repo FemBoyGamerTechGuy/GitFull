@@ -1821,13 +1821,6 @@ impl<'a> Parser<'a> {
     /// primary := '(' ternary ')' | '[' args ']' | literal | machine | call
     fn parse_primary(&mut self) -> Val {
         match self.next() {
-            Tok::LParen => {
-                let v = self.parse_ternary();
-                if *self.peek() == Tok::RParen {
-                    self.next();
-                }
-                v
-            }
             Tok::LBracket => {
                 let mut items = Vec::new();
                 if *self.peek() != Tok::RBracket {
@@ -2053,6 +2046,41 @@ pub fn requiredness_of(
         };
     }
     (Requiredness::Required, String::new())
+}
+
+/// The positional (name) arguments of a `dependency(…)` call, in declared
+/// order — meson's multi-name fallback form
+/// `dependency('libsystemd', 'libelogind', …)` tries each name in order
+/// and uses the **first one that is found**.
+///
+/// Every positional argument of `dependency()` is a dependency name;
+/// kwarg-shaped segments (`required:`, `version:`, `fallback:`, …) are
+/// skipped. A call whose FIRST positional argument is not a string
+/// literal (a variable/computed name) declares nothing statically
+/// knowable and yields an EMPTY list — the same skip the single-name
+/// recording applies. A dynamic positional later in the list is skipped
+/// while the statically-known names around it keep their relative order
+/// (meson tries the chain in sequence at runtime either way).
+pub fn positional_string_names(call_args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen_positional = false;
+    for seg in split_top_level_args(call_args) {
+        let seg = clean_segment(&seg);
+        if split_kwarg(&seg).is_some() {
+            continue; // `key: value` — a kwarg, not a name
+        }
+        match string_literal(seg.trim()) {
+            Some(name) => out.push(name),
+            None if !seen_positional => {
+                // dynamic PRIMARY name: the whole call is not statically
+                // knowable
+                return Vec::new();
+            }
+            None => {} // dynamic name later in the chain: skip it
+        }
+        seen_positional = true;
+    }
+    out
 }
 
 /// The first string item of a kwarg's array-literal value — meson's

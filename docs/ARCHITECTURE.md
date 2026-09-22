@@ -497,6 +497,46 @@ the `[dep.<name>]` pin syntax. Bare-name **application** installs
 there the user asked for "a popular repo matching this text", which is
 exactly what ranked search answers.
 
+### Multi-name fallback — meson's `dependency('a', 'b', …)`
+
+Meson's `dependency()` accepts multiple positional names and uses
+**the first one that is found** — the classic idiom being
+`dependency('libsystemd', 'libelogind')` (systemd's client library,
+falling back to the standalone elogind fork on non-systemd/musl
+systems). gitfull mirrors that semantics structurally:
+
+* the scanner records the **whole name chain in declared order**
+  (`DeclaredDep::alt_names`; kwargs like `required:`/`version:` are
+  never names, built-ins and duplicates are dropped);
+* the planner runs the per-name layers (override pin → wrap → vendored
+  tree → in-tree provides → shared cache → curated map) **for each name
+  in order** — the first name that resolves satisfies the call, and
+  later names are never also fetched. gitfull does not require both:
+  resolving whichever name has a sound source is exactly what meson's
+  runtime lookup does with whichever name is present;
+* required/optional classification covers the **whole call** (`meson`
+  evaluates `required:` once for the entire chain): an optional
+  multi-name dependency that resolves nowhere is logged
+  (`optional dependency 'libsystemd' not available — continuing
+  without it (fallbacks tried in order: libelogind)`) and skipped,
+  never searched, never prompted;
+* only when NO name resolves does the flagged search fallback run —
+  per name, in the same order; the first name with candidates is the
+  one whose candidates are shown. If every name comes up empty, the
+  error surfaces under the primary name (its pin hint names the
+  dependency the manifest actually led with).
+
+A user `[dep.<name>]` pin is consulted **at its position in the
+chain**: the primary's curated mapping wins first (meson's order), and
+a pin on a fallback name applies when resolution reaches it — i.e.
+when the primary is unresolvable. To force the fallback *instead* of a
+resolvable primary (a musl deployment wanting elogind even though
+libsystemd is curated), pin the PRIMARY name to the fallback's source:
+`[dep.libsystemd] source = "https://github.com/elogind/elogind"` —
+the built tree then provides `libelogind.pc`, and the target app's own
+meson still resolves the same two-name call through its runtime
+fallback order.
+
 ### Anonymous generic remotes and auth rejections
 
 A URL whose host matches no `[forge.<name>]` entry is fetched as an
@@ -538,8 +578,10 @@ repositories their maintainers actually publish from:
   fontconfig, pixman, libsoup, json-glib, libadwaita, libgee,
   libnotify, appstream, libarchive, libxml2, openssl, libcurl, sqlite,
   zlib, libpng, libjpeg-turbo, SDL (2 and 3, on their correct
-  branches), wayland, libdrm, libinput, dbus, xkbcommon, and
-  similarly-scoped others — **seeded, not exhaustive**;
+  branches), wayland, libdrm, libinput, dbus, xkbcommon, the systemd
+  family (`libsystemd`, `libelogind`, `libudev` — component-scoped,
+  see the next section), and similarly-scoped others — **seeded, not
+  exhaustive**;
 * **extensible and overridable via configuration, not code**: a
   `[dep.<name>]` entry in gitfull.conf always wins over the table
   (that is also how names missing from the seed set are pinned — see
@@ -566,6 +608,114 @@ depgraph.rs still contains zero per-repo knowledge — it parses
 whatever a repository declares. The curated map is the resolution
 side's equivalent of the toolchain catalog: shared, reviewable,
 config-overridable upstream data.
+
+The table's systemd-family entries — `libsystemd` →
+github.com/systemd/systemd, `libelogind` → github.com/elogind/elogind
+(the second name of the multi-name fallback above), and `libudev` →
+the systemd monorepo (another component; elogind's current main
+hard-requires it at configure time) — carry **component build
+scopes**, the mechanism the next section describes.
+
+## Component-scoped builds of monorepos
+
+Some curated upstreams are multi-component monorepos: building
+`ninja && ninja install` there would compile an entire suite (in
+systemd's case: every daemon, tool and generator) to obtain one
+library. gitfull scopes such builds to the component, using scoping
+**the upstream projects themselves define** — verified against
+systemd's and elogind's own meson files on `main`:
+
+* systemd ships `alias_target('libsystemd', …)` (and
+  `alias_target('libudev', …)`) naming the component libraries, tags
+  them `install_tag: 'libsystemd'` / `'libudev'`, tags its public
+  headers and every `.pc` file `devel`, and aggregates all four `.pc`
+  custom targets under `alias_target('devel', …)`;
+* elogind (a systemd fork) does the same with
+  `alias_target('libelogind', …)` and `alias_target('devel',
+  libelogind_pc)`.
+
+gitfull's scoped recipe for a scoped entry (`build_targets` +
+`install_tags`, in the curated table or a `[dep.<name>]` override):
+
+1. `meson setup <build> --prefix <prefix>` — unchanged;
+2. `ninja -C <build> <targets…>` — compiles **only** the component's
+   own alias targets (e.g. `libsystemd devel`), never `all`;
+3. `meson install -C <build> --no-rebuild --tags <tags>` — copies
+   **only** the component's tagged files.
+
+The `--no-rebuild` flag is load-bearing and the reason this mechanism
+exists as a pair: meson's generated ninja `install` target depends on
+`all` (verified empirically on meson 1.12: a tagged install without
+`--no-rebuild` still compiled an unrelated executable of a test
+project). Tags alone scope the *copy* step; `--no-rebuild` is what
+scopes the *compile* step. Symmetrically, `--no-rebuild` alone would
+abort on any tagged-but-unbuilt artifact — which is why the entry's
+build targets include upstream's `devel` alias: it builds **every**
+`.pc` file in one shot, so the `devel`-tagged install never trips
+over an unbuilt artifact. (Empirically confirmed: an install filtered
+to tags whose outputs were not built fails with `ERROR: File 'bar.pc'
+could not be found`.)
+
+The over-provision this causes is deliberate and useful: a
+`libsystemd,devel`-tagged install also installs the other devel files
+of the tree (`libudev.pc`, the headers — plain copies/renders, no C
+compilation), so the resulting shared-cache entry **provides every
+module of the monorepo**, and a sibling dependency (`libudev`) reuses
+that one fetch/build through the identity dedup instead of rebuilding
+the same tree under a second scope.
+
+Scoping is looked up **per dependency name** at build time (user
+override's `build_targets`/`install_tags` first; the curated entry's
+scope second; an override that pins only a `source` keeps the curated
+scope — pinning a fork of the same module wants the same component).
+The **app itself is never component-scoped**: a declared name's scope
+applies to the dependency it resolved, not to whatever repository the
+user asked to install. Non-meson build systems ignore scoping.
+
+**Configure-time requirements** (read from the upstream meson files,
+not assumed): systemd's `meson.setup` hard-requires `gperf` and
+python3 with the `jinja2` module (its `.pc` files are jinja2
+templates; elogind renders with its own `meson-render-jinja2.py`
+script but still needs python3, and elogind additionally declares a
+hard `libcap` + `libudev` dependency at configure time). gitfull's
+toolchain catalog provisions gcc/python/meson/ninja/cmake/vala/rust;
+`gperf` and `libcap` are **not** provisioned today, so a from-source
+libsystemd/elogind build additionally needs them present in the target
+app's build environment. The failure mode is a clean configure error
+naming the missing program — never a silent fallback.
+
+## Target-app dependencies vs. gitfull's own binary
+
+The constraint, stated in the original spec and unchanged since: the
+curated-map entries for `libsystemd`, `libelogind`, `libudev` (and
+`dbus-1`, which was already seeded) exist **only to resolve a TARGET
+application's build-time dependencies**. Building libsystemd inside a
+target app's isolated sandbox is exactly the same category as GTK,
+GLib and every other curated library there.
+
+**gitfull's own binary must never link against, depend on, or embed
+libsystemd/systemd/D-Bus/elogind.** Three properties keep that true,
+and a test enforces each surface (`tests/cargo_deps.rs`,
+`gitfull_binary_never_links_systemd_family`):
+
+1. gitfull's own crate graph is pinned to `serde` + `toml` (the
+   dependency-budget test) — nothing systemd-family or D-Bus can enter
+   it through `[dependencies]`;
+2. the resolved graph (Cargo.lock package names) is scanned for the
+   family — a transitive `zbus`/`sys-dbus`-style crate would appear
+   there;
+3. the actually-compiled binary's dynamic link set is checked (`ldd`)
+   for `libsystemd`/`libelogind`/`libudev`/`libdbus`-style shared
+   objects.
+
+The isolation is structural, not convention: dependency resolution
+and building happen inside the target app's sandbox with the
+toolchain-managed compiler (`exec` classes in gitproc.rs), the
+resulting libraries land in the shared library cache
+(`<root>/libs/`), and the only sanctioned sandbox-escape is binary
+collection from the app's own install prefix. Nothing about resolving
+or building a systemd-family library ever touches gitfull's own crate
+dependency tree or process image.
 
 ## Shared library cache (libcache.rs)
 

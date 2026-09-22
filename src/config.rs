@@ -171,6 +171,21 @@ pub struct DepOverride {
     /// a project declares a dependency it does not actually need).
     #[serde(default)]
     pub skip: bool,
+    /// **Component-scoped meson build** (multi-component monorepos —
+    /// meson dependencies only): compile ONLY these ninja targets
+    /// (upstream's own component alias targets, e.g. systemd's
+    /// `libsystemd`) instead of the whole suite. Overrides the curated
+    /// entry's scoping for this name; empty means "compile everything"
+    /// (useful with `install_tags` alone).
+    #[serde(default)]
+    pub build_targets: Vec<String>,
+    /// Install-tag filter for `meson install --tags …` (meson
+    /// dependencies only): copy only files upstream tagged for the
+    /// component, e.g. `"libsystemd,devel"`. Overridden together with
+    /// `build_targets`; when neither is set the curated entry's scoping
+    /// applies.
+    #[serde(default)]
+    pub install_tags: Option<String>,
 }
 
 /// `[toolchain]` — toolchain management.

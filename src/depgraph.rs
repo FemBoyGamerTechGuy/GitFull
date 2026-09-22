@@ -110,6 +110,12 @@ pub struct DeclaredDep {
     /// source for the name (e.g. `dependency('xmlb', fallback:
     /// ['libxmlb', …])` resolves through subprojects/libxmlb.wrap).
     pub fallback_subproject: Option<String>,
+    /// Fallback names declared AFTER the primary in the same meson call
+    /// — `dependency('libsystemd', 'libelogind', …)` tries names in
+    /// order and uses the FIRST one that resolves. Normalized,
+    /// deduplicated, declared order preserved; empty for single-name
+    /// calls and for non-meson build systems.
+    pub alt_names: Vec<String>,
 }
 
 /// A parsed meson subproject wrap file.
@@ -602,14 +608,33 @@ fn record_meson_call(
     mctx: &MesonScanCtx<'_>,
     vars: Option<&HashMap<String, crate::mesoneval::Val>>,
 ) {
+    // positional arguments: the dependency-name chain, in meson's own
+    // fallback order (`dependency('libsystemd', 'libelogind')` tries
+    // libsystemd first, libelogind only if that is not found)
+    let names = crate::mesoneval::positional_string_names(call);
     // first argument: a string literal (the dependency name)
-    let Some(name) = first_string_arg(call) else {
+    let Some(name) = names.first().cloned() else {
         return; // dynamic name (variable/computed): not statically knowable
     };
     if name.is_empty() || MESON_BUILTINS.contains(&name.as_str()) {
         // build-system built-ins (threads, gtest, ...) are satisfied by
         // the toolchain itself: skip entirely
         return;
+    }
+    // the remaining names of the chain — normalized, built-ins and
+    // duplicates dropped, order preserved
+    let primary_norm = normalize_name(&name);
+    let mut alt_names: Vec<String> = Vec::new();
+    for n in &names[1..] {
+        let norm = normalize_name(n);
+        if norm.is_empty()
+            || norm == primary_norm
+            || MESON_BUILTINS.contains(&norm.as_str())
+            || alt_names.contains(&norm)
+        {
+            continue;
+        }
+        alt_names.push(norm);
     }
     let version = extract_kwarg_string(call, "version");
     // meson's own fallback semantics: the first element of
@@ -633,6 +658,7 @@ fn record_meson_call(
         origin: origin.to_string(),
         git_url: None,
         fallback_subproject,
+        alt_names,
     };
     match req {
         crate::mesoneval::Requiredness::Required => deps.required.push(d),
@@ -809,6 +835,7 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
                 origin: format!("{origin_base}:{line}"),
                 git_url: None,
                 fallback_subproject: None,
+                alt_names: Vec::new(),
             };
             if required {
                 deps.required.push(d);
@@ -1144,6 +1171,7 @@ fn scan_cargo_toml(
                     origin: origin.clone(),
                     git_url,
                     fallback_subproject: None,
+                    alt_names: Vec::new(),
                 };
                 if is_dev {
                     // dev-dependencies only build tests/examples: reported,
@@ -1235,6 +1263,7 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                     origin: format!("{origin}:{line}"),
                     git_url: None,
                     fallback_subproject: None,
+                    alt_names: Vec::new(),
                 };
                 if required {
                     deps.required.push(d);
@@ -1296,6 +1325,7 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                         origin: format!("{origin}:{line}"),
                         git_url: None,
                         fallback_subproject: None,
+                        alt_names: Vec::new(),
                     };
                     if required {
                         deps.required.push(d);
@@ -1460,6 +1490,7 @@ fn scan_make(src: &Path) -> Result<DeclaredDeps> {
                 origin: format!("Makefile:{}", i + 1),
                 git_url: None,
                 fallback_subproject: None,
+                alt_names: Vec::new(),
             });
         }
     }
@@ -1570,6 +1601,68 @@ cc = meson.get_compiler('c')
             .iter()
             .chain(deps.optional.iter())
             .any(|x| x.name == "threads"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_multi_name_fallback_chain_is_recorded_in_order() {
+        let d = tmpdir("meson-multiname");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('sd-client', 'c')
+
+# the classic multi-name fallback: meson tries libsystemd first, and
+# only if that is not found does it try libelogind (non-systemd/musl
+# systems). gitfull records the whole chain, in declared order.
+login_dep = dependency('libsystemd', 'libelogind', version: '>=239')
+# optional multi-name: the chain carries regardless of requiredness
+net_dep = dependency('opt-primary-fixture', 'opt-fallback-fixture', required: false)
+# kwargs are never names; built-ins and duplicates in the chain are
+# dropped; normalization lowercases (cmake-style CamelCase never
+# appears in meson, but be conservative)
+mixed = dependency('Foo', 'foo', 'threads', 'Bar')
+# a dynamic first name declares nothing statically knowable — the whole
+# call is skipped, exactly like the single-name form
+dyn = dependency(some_var, 'libelogind')
+# fallback: ['subproject', 'var'] kwarg still names the wrap
+wrap_dep = dependency('xmlb', 'libxmlb', fallback: ['libxmlb', 'xmlb_dep'])
+"#,
+        )
+        .unwrap();
+
+        let deps = scan(&d, BuildSystem::Meson).unwrap();
+        assert_eq!(
+            names(&deps.required),
+            vec!["foo", "libsystemd", "xmlb"]
+        );
+        assert_eq!(names(&deps.optional), vec!["opt-primary-fixture"]);
+
+        let find = |n: &str| {
+            deps.required
+                .iter()
+                .chain(deps.optional.iter())
+                .find(|x| x.name_norm == n)
+                .unwrap_or_else(|| panic!("missing {n}"))
+        };
+        // the primary name leads; the fallback chain preserves declared
+        // order, deduplicates, and drops build-system built-ins
+        let sd = find("libsystemd");
+        assert_eq!(sd.alt_names, vec!["libelogind"]);
+        // version kwarg survives alongside the chain
+        assert_eq!(sd.version.as_deref(), Some(">=239"));
+        // dedup of the primary inside the chain + built-in dropping
+        let foo = find("foo");
+        assert_eq!(foo.alt_names, vec!["bar"]);
+        assert_eq!(foo.name, "Foo");
+        // the fallback kwarg is still read (meson's wrap semantics)
+        let xmlb = find("xmlb");
+        assert_eq!(xmlb.fallback_subproject.as_deref(), Some("libxmlb"));
+        assert_eq!(xmlb.alt_names, vec!["libxmlb"]);
+        // an optional multi-name call keeps its chain too (requiredness
+        // covers the whole call, meson evaluates `required:` once)
+        let opt = find("opt-primary-fixture");
+        assert_eq!(opt.alt_names, vec!["opt-fallback-fixture"]);
+        assert!(opt.optional_why.as_deref().unwrap().contains("required: false"));
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -3116,3 +3209,4 @@ other:
         let _ = fs::remove_dir_all(&d);
     }
 }
+

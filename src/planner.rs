@@ -287,7 +287,61 @@ struct BuildStep {
     cwd: PathBuf,
 }
 
-fn build_commands(bs: crate::manifest::BuildSystem, sb: &Sandbox, jobs: usize) -> Vec<BuildStep> {
+/// Effective **meson build scoping** for one dependency — how gitfull
+/// builds a multi-component monorepo without building the entire suite
+/// (see docs/ARCHITECTURE.md, "Component-scoped builds of monorepos"):
+///
+/// * `targets` — compile ONLY these ninja targets (upstream's own
+///   component alias targets — systemd's `libsystemd`, elogind's
+///   `libelogind` / `devel`) instead of `all`;
+/// * `install_tags` — `meson install --no-rebuild --tags <tags>`: copy
+///   only files upstream tagged for the component. `--no-rebuild` is
+///   load-bearing: meson's `install` ninja target depends on `all`, so
+///   a plain install would compile the whole monorepo anyway.
+///
+/// Derived per dependency NAME: the `[dep.<name>]` override's
+/// `build_targets`/`install_tags` when the user sets them, else the
+/// curated entry's scoping when it has one. Empty `targets` with a tag
+/// filter set means "compile everything (already the default), install
+/// only the tagged files".
+#[derive(Debug, Clone, PartialEq)]
+pub struct MesonScope {
+    pub targets: Vec<String>,
+    pub install_tags: String,
+}
+
+/// The build scoping that applies to a dependency resolved under
+/// `name_norm` (user override first, curated entry second). Exposed for
+/// tests; the walk calls it per fetched node at build time.
+pub fn meson_scope_for(cfg: &Config, name_norm: &str) -> Option<MesonScope> {
+    if let Some(ov) = cfg.dep_override_for(name_norm) {
+        if !ov.build_targets.is_empty() || ov.install_tags.is_some() {
+            return Some(MesonScope {
+                targets: ov.build_targets.clone(),
+                install_tags: ov
+                    .install_tags
+                    .clone()
+                    .unwrap_or_else(|| "runtime,devel".to_string()),
+            });
+        }
+        // an override that defines no scoping (a plain source pin or
+        // skip) falls through to the curated entry's scoping for the
+        // name: a pin of the same module wants the same component scope
+    }
+    crate::libmap::lookup(name_norm)
+        .and_then(|e| e.scope())
+        .map(|(targets, tags)| MesonScope {
+            targets: targets.iter().map(|t| t.to_string()).collect(),
+            install_tags: tags.to_string(),
+        })
+}
+
+fn build_commands(
+    bs: crate::manifest::BuildSystem,
+    sb: &Sandbox,
+    jobs: usize,
+    scope: Option<&MesonScope>,
+) -> Vec<BuildStep> {
     use crate::manifest::BuildSystem::*;
     let s = |label: &str, argv: Vec<String>, cwd: PathBuf| BuildStep {
         label: label.to_string(),
@@ -337,8 +391,8 @@ fn build_commands(bs: crate::manifest::BuildSystem, sb: &Sandbox, jobs: usize) -
                 sb.src(),
             ),
         ],
-        Meson => vec![
-            s(
+        Meson => {
+            let mut steps = vec![s(
                 "setup",
                 vec![
                     "meson".into(),
@@ -348,18 +402,66 @@ fn build_commands(bs: crate::manifest::BuildSystem, sb: &Sandbox, jobs: usize) -
                     prefix,
                 ],
                 sb.src(),
-            ),
-            s(
-                "build",
-                vec!["ninja".into(), "-C".into(), build.clone()],
-                sb.build(),
-            ),
-            s(
-                "install",
-                vec!["ninja".into(), "-C".into(), build, "install".into()],
-                sb.build(),
-            ),
-        ],
+            )];
+            match scope {
+                // component-scoped build of a multi-component monorepo:
+                // compile ONLY the component's own targets, then install
+                // ONLY the component's tagged files without rebuilding
+                // (meson's `install` target depends on `all` — the
+                // `--no-rebuild` flag is what actually scopes the build)
+                Some(sc) if !sc.targets.is_empty() => {
+                    let mut argv = vec!["ninja".into(), "-C".into(), build.clone()];
+                    argv.extend(sc.targets.iter().cloned());
+                    steps.push(s("build-scoped", argv, sb.build()));
+                    steps.push(s(
+                        "install-scoped",
+                        vec![
+                            "meson".into(),
+                            "install".into(),
+                            "-C".into(),
+                            build,
+                            "--no-rebuild".into(),
+                            "--tags".into(),
+                            sc.install_tags.clone(),
+                        ],
+                        sb.build(),
+                    ));
+                }
+                // tags-only scoping: full compile, filtered install
+                Some(sc) => {
+                    steps.push(s(
+                        "build",
+                        vec!["ninja".into(), "-C".into(), build.clone()],
+                        sb.build(),
+                    ));
+                    steps.push(s(
+                        "install-scoped",
+                        vec![
+                            "meson".into(),
+                            "install".into(),
+                            "-C".into(),
+                            build,
+                            "--tags".into(),
+                            sc.install_tags.clone(),
+                        ],
+                        sb.build(),
+                    ));
+                }
+                None => {
+                    steps.push(s(
+                        "build",
+                        vec!["ninja".into(), "-C".into(), build.clone()],
+                        sb.build(),
+                    ));
+                    steps.push(s(
+                        "install",
+                        vec!["ninja".into(), "-C".into(), build, "install".into()],
+                        sb.build(),
+                    ));
+                }
+            }
+            steps
+        }
         Cmake => vec![
             s(
                 "configure",
@@ -758,6 +860,22 @@ enum DepPlan {
 /// (`required: false`, feature options in `'auto'`) pass `false` — an
 /// unresolved optional dependency is logged and skipped, NEVER
 /// prompted for: the project itself builds fine without it.
+///
+/// **Multi-name fallback** — meson's own semantics for
+/// `dependency('libsystemd', 'libelogind', …)`: layers 2–6 run for each
+/// declared name **in order**, and the FIRST name that resolves
+/// satisfies the call; later names are never also fetched (gitfull does
+/// not require both). Only when NO name resolves does layer 7 run, per
+/// name in the same order. The required/optional classification covers
+/// the whole call: an optional multi-name dependency that resolves
+/// nowhere is logged and skipped, exactly like an optional single-name
+/// one.
+///
+/// Returns `(resolved display name, resolved normalized name, plan)`.
+/// For a fallback-name resolution both are the FALLBACK's names — the
+/// name that actually resolved is what registers in the shared cache,
+/// what appears in resolution output, and what meson build scoping is
+/// looked up by at build time.
 fn plan_declared_dep(
     cfg: &Config,
     ctx: &ExecCtx,
@@ -765,19 +883,85 @@ fn plan_declared_dep(
     declared: &DeclaredDeps,
     d: &DeclaredDep,
     allow_search: bool,
-) -> Result<DepPlan> {
+) -> Result<(String, String, DepPlan)> {
     if d.kind == crate::depgraph::DepKind::CrateRegistry {
         println!(
             "gitfull: dep `{}`: cargo registry dependency — cargo itself \
              fetches it into the app's sandbox at build time",
             d.name
         );
-        return Ok(DepPlan::Satisfied);
+        return Ok((d.name.clone(), d.name_norm.clone(), DepPlan::Satisfied));
     }
-    if let Some(ov) = cfg.dep_override_for(&d.name) {
+    // the name chain in meson's own fallback order: the primary name,
+    // then the names declared after it in the same call
+    let mut chain: Vec<(String, String)> = vec![(d.name.clone(), d.name_norm.clone())];
+    for alt in &d.alt_names {
+        // fallback names are stored normalized; the display form is the
+        // same string (meson module names are canonically lowercase)
+        chain.push((alt.clone(), alt.clone()));
+    }
+    for (i, (display, norm)) in chain.iter().enumerate() {
+        if let Some(plan) = plan_dep_name(cfg, cache, declared, d, display, norm, i > 0)? {
+            return Ok((display.clone(), norm.clone(), plan));
+        }
+    }
+    if !allow_search {
+        // an OPTIONAL dependency with no sound source under ANY of its
+        // declared names: not available — the caller logs it and
+        // continues. Never searched (an unconfirmed candidate would be
+        // useless: prompting for an optional dependency is forbidden,
+        // and auto-building an unconfirmed match is forbidden for every
+        // dependency).
+        return Ok((d.name.clone(), d.name_norm.clone(), DepPlan::Missing));
+    }
+    // ranked forge search: FLAGGED FALLBACK — candidates only, never an
+    // auto-selected build (see DepPlan::Unconfirmed). Names are searched
+    // in meson's fallback order; the first name with candidates wins,
+    // and only when every name comes up empty does the error surface
+    // (the primary name's — its pin hint names the dependency the
+    // manifest actually led with).
+    let mut first_err: Option<GitfullError> = None;
+    for (display, norm) in &chain {
+        match search::rank_dep_candidates(cfg, ctx, display) {
+            Ok(cands) => {
+                return Ok((display.clone(), norm.clone(), DepPlan::Unconfirmed(cands)));
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap())
+}
+
+/// Layers 2–6 of [`plan_declared_dep`] for ONE name of the declared
+/// chain. `Ok(None)` = this name resolved nowhere sound — the caller
+/// falls through to the NEXT name (meson's own fallback order) or to
+/// search. `alt` marks fallback names (declared after the primary) so
+/// resolution output reads
+/// `` dep `libelogind` (fallback name for `libsystemd`) ``.
+fn plan_dep_name(
+    cfg: &Config,
+    cache: &LibCache,
+    declared: &DeclaredDeps,
+    d: &DeclaredDep,
+    name_display: &str,
+    name_norm: &str,
+    alt: bool,
+) -> Result<Option<DepPlan>> {
+    let label = if alt {
+        format!("{name_display} (fallback name for `{}`)", d.name)
+    } else {
+        name_display.to_string()
+    };
+    if let Some(ov) = cfg.dep_override_for(name_display) {
         if ov.skip {
-            println!("gitfull: dep `{}`: skipped ([dep.{}] skip = true)", d.name, d.name);
-            return Ok(DepPlan::Satisfied);
+            println!(
+                "gitfull: dep `{label}`: skipped ([dep.{name_display}] skip = true)"
+            );
+            return Ok(Some(DepPlan::Satisfied));
         }
         if let Some(src) = &ov.source {
             let mut spec = PkgSpec::parse(src)?;
@@ -785,15 +969,14 @@ fn plan_declared_dep(
                 spec.git_ref = ov.git_ref.clone();
             }
             println!(
-                "gitfull: dep `{}`: pinned via [dep.{}] -> {}",
-                d.name,
-                d.name,
+                "gitfull: dep `{label}`: pinned via [dep.{name_display}] -> {}",
                 spec.key()
             );
             // identity-level cache check BEFORE fetching: this exact
             // pinned source may already have been built by an earlier
             // install — then nothing is cloned at all
-            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
+            return identity_or_fetch(cfg, cache, name_norm, DepSpec::Package(spec))
+                .map(Some);
         }
     }
     // meson wraps: the manifest's own pin for this name wins over
@@ -804,8 +987,8 @@ fn plan_declared_dep(
         .wraps
         .iter()
         .find(|w| {
-            w.name.to_ascii_lowercase() == d.name_norm
-                || w.provides.iter().any(|p| p.to_ascii_lowercase() == d.name_norm)
+            w.name.to_ascii_lowercase() == name_norm
+                || w.provides.iter().any(|p| p.to_ascii_lowercase() == name_norm)
                 || d.fallback_subproject
                     .as_deref()
                     .map(|f| w.name.eq_ignore_ascii_case(f))
@@ -814,17 +997,19 @@ fn plan_declared_dep(
     {
         if let Some(git) = &w.git {
             println!(
-                "gitfull: dep `{}`: meson wrap (git) -> {} ({})",
-                d.name, git.0, git.1
+                "gitfull: dep `{label}`: meson wrap (git) -> {} ({})",
+                git.0, git.1
             );
-            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::WrapGit(w.clone()));
+            return identity_or_fetch(cfg, cache, name_norm, DepSpec::WrapGit(w.clone()))
+                .map(Some);
         }
         if let Some(file) = &w.file {
             println!(
-                "gitfull: dep `{}`: meson wrap (file) -> {}",
-                d.name, file.0
+                "gitfull: dep `{label}`: meson wrap (file) -> {}",
+                file.0
             );
-            return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::WrapFile(w.clone()));
+            return identity_or_fetch(cfg, cache, name_norm, DepSpec::WrapFile(w.clone()))
+                .map(Some);
         }
     }
     // vendored subproject trees are used in-tree; fetching anything
@@ -832,50 +1017,43 @@ fn plan_declared_dep(
     if declared
         .vendored
         .iter()
-        .any(|v| v.to_ascii_lowercase() == d.name_norm)
+        .any(|v| v.to_ascii_lowercase() == name_norm)
     {
         println!(
-            "gitfull: dep `{}`: vendored subproject in-tree — nothing to fetch",
-            d.name
+            "gitfull: dep `{label}`: vendored subproject in-tree — nothing to fetch"
         );
-        return Ok(DepPlan::Satisfied);
+        return Ok(Some(DepPlan::Satisfied));
     }
     // a module the tree's own build provides (meson.override_dependency):
     // building THIS tree already satisfies it — nothing to fetch
-    if declared
-        .provided_in_tree
-        .iter()
-        .any(|p| p == &d.name_norm)
-    {
+    if declared.provided_in_tree.iter().any(|p| p == name_norm) {
         println!(
-            "gitfull: dep `{}`: provided by this project's own build \
-             (meson.override_dependency) — nothing to fetch",
-            d.name
+            "gitfull: dep `{label}`: provided by this project's own build \
+             (meson.override_dependency) — nothing to fetch"
         );
-        return Ok(DepPlan::Satisfied);
+        return Ok(Some(DepPlan::Satisfied));
     }
     // shared library cache: reuse a build a previous install produced
-    if let Some((key, dir)) = cache.find_providing(&d.name_norm) {
+    if let Some((key, dir)) = cache.find_providing(name_norm) {
         println!(
-            "gitfull: dep `{}`: shared lib cache hit (entry {}, built by an \
+            "gitfull: dep `{label}`: shared lib cache hit (entry {}, built by an \
              earlier install — no rebuild)",
-            d.name, key
+            key
         );
-        return Ok(DepPlan::CacheHit(dir));
+        return Ok(Some(DepPlan::CacheHit(dir)));
     }
     // curated upstream map: the sound strategy for module names — a
     // well-known module's correct upstream is knowledge, not something
     // popularity ranking can infer. Extensible/overridable via [dep].
-    if let Some(entry) = crate::libmap::lookup(&d.name_norm) {
+    if let Some(entry) = crate::libmap::lookup(name_norm) {
         let mut spec = PkgSpec::parse(entry.source)?;
         if spec.git_ref.is_none() {
             spec.git_ref = entry.git_ref.map(|s| s.to_string());
         }
         println!(
-            "gitfull: dep `{}`: curated upstream map -> {}{} ({}) — well-known \
+            "gitfull: dep `{label}`: curated upstream map -> {}{} ({}) — well-known \
              module; sibling module names mapping to this same source \
              deduplicate to one fetch/build",
-            d.name,
             entry.source,
             entry
                 .git_ref
@@ -883,20 +1061,11 @@ fn plan_declared_dep(
                 .unwrap_or_default(),
             entry.label
         );
-        return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
+        return identity_or_fetch(cfg, cache, name_norm, DepSpec::Package(spec)).map(Some);
     }
-    if !allow_search {
-        // an OPTIONAL dependency with no sound source: not available —
-        // the caller logs it and continues. Never searched (an
-        // unconfirmed candidate would be useless: prompting for an
-        // optional dependency is forbidden, and auto-building an
-        // unconfirmed match is forbidden for every dependency).
-        return Ok(DepPlan::Missing);
-    }
-    // ranked forge search: FLAGGED FALLBACK — candidates only, never an
-    // auto-selected build (see DepPlan::Unconfirmed)
-    let candidates = search::rank_dep_candidates(cfg, ctx, &d.name)?;
-    Ok(DepPlan::Unconfirmed(candidates))
+    // this name resolved nowhere sound — the caller tries the next name
+    // of the chain (or search)
+    Ok(None)
 }
 
 /// Resolve a *pinned* dependency source (user `[dep.<name>]` override or
@@ -948,27 +1117,39 @@ fn print_dep_scan(declared: &DeclaredDeps) {
     }
     for d in req {
         println!(
-            "gitfull:   dep {} {}({}; {})",
+            "gitfull:   dep {} {}({}; {}){}",
             d.name,
             d.version
                 .as_deref()
                 .map(|v| format!("{v} "))
                 .unwrap_or_default(),
             d.kind.label(),
-            d.origin
+            d.origin,
+            alt_chain_note(d)
         );
     }
     for d in &declared.optional {
         println!(
             "gitfull:   dep {} ({}; optional{} — resolved silently when a \
-             sound source exists, never blocking)",
+             sound source exists, never blocking){}",
             d.name,
             d.kind.label(),
             d.optional_why
                 .as_deref()
                 .map(|w| format!(": {w}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            alt_chain_note(d)
         );
+    }
+}
+
+/// ` (fallbacks: a, b)` — the multi-name fallback chain of a declared
+/// dependency, for scan output (meson tries the names in order).
+fn alt_chain_note(d: &DeclaredDep) -> String {
+    if d.alt_names.is_empty() {
+        String::new()
+    } else {
+        format!(" [fallbacks: {}]", d.alt_names.join(", "))
     }
 }
 
@@ -1363,25 +1544,25 @@ fn plan_scan(
         .filter(|d| d.kind != crate::depgraph::DepKind::CrateRegistry)
     {
         match plan_declared_dep(cfg, ctx, cache, scan, d, true)? {
-            DepPlan::Satisfied => {}
-            DepPlan::CacheHit(dir) => {
-                push_cache_hit_closure(cache, &dir, &d.name, &mut hits);
+            (_, _, DepPlan::Satisfied) => {}
+            (rname, _, DepPlan::CacheHit(dir)) => {
+                push_cache_hit_closure(cache, &dir, &rname, &mut hits);
             }
-            DepPlan::Fetch(spec) => queue.push_back(QueuedDep {
+            (rname, rnorm, DepPlan::Fetch(spec)) => queue.push_back(QueuedDep {
                 spec,
                 parent,
-                declared: Some(d.name.clone()),
-                name_norm: Some(d.name_norm.clone()),
-                cache_name: d.name_norm.clone(),
+                declared: Some(rname.clone()),
+                name_norm: Some(rnorm.clone()),
+                cache_name: rnorm,
             }),
-            DepPlan::Unconfirmed(cands) => {
+            (rname, rnorm, DepPlan::Unconfirmed(cands)) => {
                 if dry_run {
                     println!(
                         "gitfull: dep `{}`: UNRESOLVED — only unconfirmed search \
                          candidates exist; a real install stops here for a \
                          [dep] pin or an interactive confirmation. Nothing \
                          would be auto-built.",
-                        d.name
+                        rname
                     );
                 } else {
                     // non-interactive sessions (no real terminal on BOTH
@@ -1389,7 +1570,7 @@ fn plan_scan(
                     // only ever attempted behind a both-fds TTY check,
                     // never on an inherited fd nobody is servicing
                     let spec = confirm_unconfirmed_search_dep(
-                        &d.name,
+                        &rname,
                         &cands,
                         ctx.interactive(),
                         &read_stdin_line,
@@ -1397,14 +1578,14 @@ fn plan_scan(
                     queue.push_back(QueuedDep {
                         spec: DepSpec::Package(spec),
                         parent,
-                        declared: Some(d.name.clone()),
-                        name_norm: Some(d.name_norm.clone()),
-                        cache_name: d.name_norm.clone(),
+                        declared: Some(rname.clone()),
+                        name_norm: Some(rnorm.clone()),
+                        cache_name: rnorm,
                     });
                 }
             }
             // search is always allowed for required deps — unreachable
-            DepPlan::Missing => {}
+            (_, _, DepPlan::Missing) => {}
         }
     }
     // optional dependencies: same sound layers, silently; never search,
@@ -1415,30 +1596,43 @@ fn plan_scan(
         .filter(|d| d.kind != crate::depgraph::DepKind::CrateRegistry)
     {
         match plan_declared_dep(cfg, ctx, cache, scan, d, false)? {
-            DepPlan::Satisfied => {}
-            DepPlan::CacheHit(dir) => {
-                push_cache_hit_closure(cache, &dir, &d.name, &mut hits);
+            (_, _, DepPlan::Satisfied) => {}
+            (rname, _, DepPlan::CacheHit(dir)) => {
+                push_cache_hit_closure(cache, &dir, &rname, &mut hits);
             }
-            DepPlan::Fetch(spec) => queue.push_back(QueuedDep {
+            (rname, rnorm, DepPlan::Fetch(spec)) => queue.push_back(QueuedDep {
                 spec,
                 parent,
-                declared: Some(d.name.clone()),
-                name_norm: Some(d.name_norm.clone()),
-                cache_name: d.name_norm.clone(),
+                declared: Some(rname.clone()),
+                name_norm: Some(rnorm.clone()),
+                cache_name: rnorm,
             }),
             // unresolved optional dependency: log and continue — the
-            // project itself builds fine without it
-            DepPlan::Missing => println!(
-                "gitfull: optional dependency `{}` not available — continuing \
-                 without it{}",
-                d.name,
-                d.optional_why
-                    .as_deref()
-                    .map(|w| format!(" ({w})"))
-                    .unwrap_or_default()
-            ),
+            // project itself builds fine without it. For a multi-name
+            // declaration the whole fallback chain is reported (meson
+            // tried each in order and found none).
+            (_, _, DepPlan::Missing) => {
+                let alts = if d.alt_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (fallbacks tried in order: {})",
+                        d.alt_names.join(", ")
+                    )
+                };
+                println!(
+                    "gitfull: optional dependency `{}{}` not available — continuing \
+                     without it{}",
+                    d.name,
+                    alts,
+                    d.optional_why
+                        .as_deref()
+                        .map(|w| format!(" ({w})"))
+                        .unwrap_or_default()
+                )
+            }
             // unreachable: no search is attempted for optional deps
-            DepPlan::Unconfirmed(_) => {}
+            (_, _, DepPlan::Unconfirmed(_)) => {}
         }
     }
     for w in &scan.wraps {
@@ -1817,7 +2011,7 @@ pub fn install(
         println!(
             "  build:   {} ({} steps)",
             resolved.build.label(),
-            build_commands(resolved.build, &sb, cfg.jobs).len()
+            build_commands(resolved.build, &sb, cfg.jobs, None).len()
         );
         for n in nodes.iter().skip(1) {
             println!(
@@ -1941,7 +2135,35 @@ pub fn install(
             &node_extra,
         );
         let jobs = nodes[idx].resolved.jobs.unwrap_or(cfg.jobs);
-        let steps = build_commands(nodes[idx].resolved.build, &nodes[idx].sandbox, jobs);
+        // meson build scoping is looked up by the declared name this
+        // node was fetched for (user override first, curated entry
+        // second) — see `meson_scope_for`. Nodes fetched as plain repo
+        // packages (no declared name) build the standard way.
+        let node_scope = nodes[idx]
+            .name_norm
+            .as_deref()
+            .and_then(|n| meson_scope_for(cfg, n));
+        if let Some(sc) = &node_scope {
+            println!(
+                "gitfull: dependency {}: component-scoped meson build (targets: {}{}; \
+                 install tags: {}) — only this component of the monorepo \
+                 is compiled, never the whole suite",
+                nodes[idx].key,
+                sc.targets.join(", "),
+                if sc.targets.is_empty() {
+                    " (all)"
+                } else {
+                    ""
+                },
+                sc.install_tags
+            );
+        }
+        let steps = build_commands(
+            nodes[idx].resolved.build,
+            &nodes[idx].sandbox,
+            jobs,
+            node_scope.as_ref(),
+        );
         let dep_ctx = ExecCtx {
             resolve_path: dep_env
                 .iter()
@@ -2038,7 +2260,10 @@ pub fn install(
         &app_extra,
     );
     let jobs = resolved.jobs.unwrap_or(cfg.jobs);
-    let steps = build_commands(resolved.build, &sb, jobs);
+    // the app itself is never component-scoped: a declared name's
+    // scoping applies to the DEPENDENCY it resolved, not to whatever
+    // repository the user asked to install
+    let steps = build_commands(resolved.build, &sb, jobs, None);
     let app_ctx = ExecCtx {
         resolve_path: app_env
             .iter()
@@ -2432,6 +2657,7 @@ mod tests {
             origin: "test".to_string(),
             git_url: None,
             fallback_subproject: None,
+            alt_names: Vec::new(),
         }
     }
 
@@ -2456,7 +2682,7 @@ mod tests {
             ("sdl3", "https://github.com/libsdl-org/SDL"),
         ] {
             match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name), true).unwrap() {
-                DepPlan::Fetch(DepSpec::Package(p)) => {
+                (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                     assert_eq!(
                         p.key(),
                         expect_url,
@@ -2476,7 +2702,7 @@ mod tests {
         let cache = empty_cache(&cfg);
         let declared = crate::depgraph::DeclaredDeps::default();
         match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("sdl2"), true).unwrap() {
-            DepPlan::Fetch(DepSpec::Package(p)) => {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                 assert_eq!(p.key(), "https://github.com/libsdl-org/SDL");
                 assert_eq!(p.git_ref.as_deref(), Some("SDL2"));
             }
@@ -2493,7 +2719,7 @@ mod tests {
         let cache = empty_cache(&cfg);
         let declared = crate::depgraph::DeclaredDeps::default();
         match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("cairo"), true).unwrap() {
-            DepPlan::Fetch(DepSpec::Package(p)) => {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                 assert_eq!(p.key(), "myorg/my-cairo-fork");
                 assert_eq!(p.git_ref.as_deref(), Some("stable"));
             }
@@ -2512,7 +2738,7 @@ mod tests {
         let mut identities = BTreeSet::new();
         for name in ["glib-2.0", "gio-unix-2.0", "gobject-2.0", "gio-2.0"] {
             match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name), true).unwrap() {
-                DepPlan::Fetch(DepSpec::Package(p)) => {
+                (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                     let planned = plan_dep_fetch(&cfg, &DepSpec::Package(p)).unwrap();
                     identities.insert(planned.identity);
                 }
@@ -2520,6 +2746,309 @@ mod tests {
             }
         }
         assert_eq!(identities.len(), 1, "{identities:?}");
+    }
+
+    // ---- multi-name fallback (meson dependency('a', 'b', ...)) ---------
+
+    fn dep_alt(name: &str, alts: &[&str], required: bool) -> DeclaredDep {
+        let mut d = dep_opt(name, required);
+        d.alt_names = alts.iter().map(|a| a.to_string()).collect();
+        d
+    }
+
+    /// The real-world fallback pair: `dependency('libsystemd',
+    /// 'libelogind')`. The primary is curated → resolves through the
+    /// systemd monorepo; the fallback name is never ALSO fetched
+    /// (gitfull does not require both, exactly like meson's own order).
+    #[test]
+    fn multi_name_primary_resolves_and_fallback_is_not_fetched() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("libsystemd", &["libelogind"], true),
+            true,
+        )
+        .unwrap()
+        {
+            (rname, rnorm, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!(rname, "libsystemd");
+                assert_eq!(rnorm, "libsystemd");
+                assert_eq!(p.key(), "https://github.com/systemd/systemd");
+                // the fallback must NOT have been consulted (elogind
+                // resolves too — a chain that fetched both would return
+                // the elogind source here instead)
+            }
+            other => panic!("libsystemd chain: expected curated Fetch, got {other:?}"),
+        }
+        // mirror image: a project on a non-systemd stack declares
+        // `dependency('libelogind')` alone — resolves through elogind
+        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("libelogind"), true)
+            .unwrap()
+        {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!(p.key(), "https://github.com/elogind/elogind");
+            }
+            other => panic!("libelogind alone: expected Fetch, got {other:?}"),
+        }
+    }
+
+    /// An unresolvable primary falls through to the fallback name, which
+    /// resolves — through whatever sound layer owns it (here the
+    /// curated map). The resolution reports the FALLBACK as the name
+    /// that satisfied the call.
+    #[test]
+    fn multi_name_unresolvable_primary_falls_through_in_order() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("no-such-module-xyz", &["also-not-a-module", "cairo"], true),
+            true,
+        )
+        .unwrap()
+        {
+            (rname, rnorm, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!((rname.as_str(), rnorm.as_str()), ("cairo", "cairo"));
+                assert_eq!(p.key(), "https://gitlab.freedesktop.org/cairo/cairo");
+            }
+            other => panic!("chain: expected the cairo fallback, got {other:?}"),
+        }
+    }
+
+    /// An OPTIONAL multi-name dependency that resolves nowhere is
+    /// Missing — logged and skipped, never searched, never prompted
+    /// (the whole chain shares the call's requiredness).
+    #[test]
+    fn multi_name_optional_missing_never_prompts() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("no-such-module-xyz", &["also-not-a-module"], false),
+            false,
+        )
+        .unwrap()
+        {
+            (_, _, DepPlan::Missing) => {}
+            other => panic!("optional chain: expected Missing, got {other:?}"),
+        }
+        // but an optional multi-name dep whose FALLBACK is curated is
+        // provisioned opportunistically ("use it if present")
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("no-such-module-xyz", &["cairo"], false),
+            false,
+        )
+        .unwrap()
+        {
+            (rname, _, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!(rname, "cairo");
+                assert_eq!(p.key(), "https://gitlab.freedesktop.org/cairo/cairo");
+            }
+            other => panic!("optional chain with curated fallback: got {other:?}"),
+        }
+    }
+
+    /// A user pin on a chain name is consulted when resolution REACHES
+    /// that name — meson's own order: the primary's curated mapping
+    /// wins first; the fallback's pin applies when the primary is
+    /// unresolvable.
+    #[test]
+    fn multi_name_user_pin_applies_at_its_position_in_the_chain() {
+        let extra =
+            "\n[dep.libelogind]\nsource = \"github:myorg/my-elogind\"\nref = \"stable\"\n";
+        let cfg = test_cfg(Some(extra));
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        // primary curated: the pin on the fallback name is not reached
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("libsystemd", &["libelogind"], true),
+            true,
+        )
+        .unwrap()
+        {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!(p.key(), "https://github.com/systemd/systemd");
+            }
+            other => panic!("expected the primary's curated source, got {other:?}"),
+        }
+        // primary unresolvable: the fallback's pin resolves it
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_alt("no-such-module-xyz", &["libelogind"], true),
+            true,
+        )
+        .unwrap()
+        {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
+                assert_eq!(p.key(), "myorg/my-elogind");
+                assert_eq!(p.git_ref.as_deref(), Some("stable"));
+            }
+            other => panic!("expected the fallback's user pin, got {other:?}"),
+        }
+    }
+
+    // ---- component-scoped meson builds (multi-component monorepos) -----
+
+    /// The scoping lookup: the curated entries for the systemd family
+    /// carry component scopes; ordinary modules do not; a user override
+    /// replaces the scope; an override WITHOUT scoping fields keeps the
+    /// curated scope (pinning a fork of the same module wants the same
+    /// component).
+    #[test]
+    fn meson_scope_lookup_user_override_and_curated_entry() {
+        let cfg = test_cfg(None);
+        // curated scope for the systemd family
+        let sc = meson_scope_for(&cfg, "libsystemd").unwrap();
+        assert_eq!(sc.targets, vec!["libsystemd", "devel"]);
+        assert_eq!(sc.install_tags, "libsystemd,devel");
+        let sc = meson_scope_for(&cfg, "libelogind").unwrap();
+        assert_eq!(sc.targets, vec!["libelogind", "devel"]);
+        // ordinary modules: standard build
+        assert!(meson_scope_for(&cfg, "glib-2.0").is_none());
+        assert!(meson_scope_for(&cfg, "zlib").is_none());
+        assert!(meson_scope_for(&cfg, "not-a-known-module-xyz").is_none());
+
+        // user override replaces the scope
+        let extra = "\n[dep.libsystemd]\nbuild_targets = [\"libsystemd\", \"devel\"]\ninstall_tags = \"libsystemd,devel\"\n";
+        let cfg = test_cfg(Some(extra));
+        let sc = meson_scope_for(&cfg, "libsystemd").unwrap();
+        assert_eq!(sc.targets, vec!["libsystemd", "devel"]);
+        assert_eq!(sc.install_tags, "libsystemd,devel");
+        // a different scope than the curated one, to prove replacement
+        let extra = "\n[dep.libsystemd]\nbuild_targets = [\"libudev\"]\ninstall_tags = \"libudev,devel\"\n";
+        let cfg = test_cfg(Some(extra));
+        let sc = meson_scope_for(&cfg, "libsystemd").unwrap();
+        assert_eq!(sc.targets, vec!["libudev"]);
+        assert_eq!(sc.install_tags, "libudev,devel");
+        // an override with only a source pin (no scoping) keeps the
+        // curated scope for the name
+        let extra = "\n[dep.libsystemd]\nsource = \"github:myorg/systemd-fork\"\n";
+        let cfg = test_cfg(Some(extra));
+        let sc = meson_scope_for(&cfg, "libsystemd").unwrap();
+        assert_eq!(sc.targets, vec!["libsystemd", "devel"]);
+        // tags-only override: full compile, filtered install
+        let extra = "\n[dep.libsystemd]\ninstall_tags = \"libsystemd\"\n";
+        let cfg = test_cfg(Some(extra));
+        let sc = meson_scope_for(&cfg, "libsystemd").unwrap();
+        assert!(sc.targets.is_empty());
+        assert_eq!(sc.install_tags, "libsystemd");
+    }
+
+    fn str_vec(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The scoped build steps themselves: compile ONLY the component's
+    /// targets, install ONLY the tagged files with `--no-rebuild` (the
+    /// load-bearing flag — meson's `install` target depends on `all`).
+    #[test]
+    fn scoped_meson_build_steps_never_compile_the_whole_monorepo() {
+        let dir = std::env::temp_dir().join(format!(
+            "gitfull-planner-scope-{}-{}",
+            std::process::id(),
+            util::epoch()
+        ));
+        let sb = Sandbox {
+            dir: dir.join("app"),
+        };
+        let build = sb.build().display().to_string();
+        let prefix = sb.prefix().display().to_string();
+
+        // scoped: the libsystemd component of the systemd monorepo
+        let scope = MesonScope {
+            targets: vec!["libsystemd".into(), "devel".into()],
+            install_tags: "libsystemd,devel".into(),
+        };
+        let steps = build_commands(
+            crate::manifest::BuildSystem::Meson,
+            &sb,
+            4,
+            Some(&scope),
+        );
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].label, "setup");
+        assert_eq!(
+            steps[0].argv,
+            str_vec(&["meson", "setup", &build, "--prefix", &prefix])
+        );
+        assert_eq!(steps[1].label, "build-scoped");
+        assert_eq!(
+            steps[1].argv,
+            str_vec(&["ninja", "-C", &build, "libsystemd", "devel"])
+        );
+        assert_eq!(steps[2].label, "install-scoped");
+        assert_eq!(
+            steps[2].argv,
+            str_vec(&[
+                "meson",
+                "install",
+                "-C",
+                &build,
+                "--no-rebuild",
+                "--tags",
+                "libsystemd,devel"
+            ])
+        );
+
+        // unscoped: the standard full build (every other entry)
+        let steps = build_commands(crate::manifest::BuildSystem::Meson, &sb, 4, None);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[1].argv, str_vec(&["ninja", "-C", &build]));
+        assert_eq!(steps[2].argv, str_vec(&["ninja", "-C", &build, "install"]));
+
+        // tags-only scope: full compile, filtered install (no
+        // --no-rebuild: everything is already built by the compile step)
+        let tags_only = MesonScope {
+            targets: vec![],
+            install_tags: "runtime".into(),
+        };
+        let steps = build_commands(
+            crate::manifest::BuildSystem::Meson,
+            &sb,
+            4,
+            Some(&tags_only),
+        );
+        assert_eq!(steps[1].argv, str_vec(&["ninja", "-C", &build]));
+        assert_eq!(
+            steps[2].argv,
+            str_vec(&["meson", "install", "-C", &build, "--tags", "runtime"])
+        );
+
+        // non-meson build systems ignore scoping entirely (same steps
+        // with and without a scope)
+        let plain = build_commands(crate::manifest::BuildSystem::Make, &sb, 4, None);
+        let scoped = build_commands(
+            crate::manifest::BuildSystem::Make,
+            &sb,
+            4,
+            Some(&scope),
+        );
+        assert_eq!(plain.len(), scoped.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Token scoping, the incident-report arm: a GitHub PAT sitting in the
@@ -2754,7 +3283,7 @@ mod tests {
         )
         .unwrap()
         {
-            DepPlan::Fetch(DepSpec::Package(p)) => {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                 assert_eq!(
                     p.key(),
                     "https://gitlab.freedesktop.org/cairo/cairo",
@@ -2775,7 +3304,7 @@ mod tests {
         )
         .unwrap()
         {
-            DepPlan::Fetch(DepSpec::Package(p)) => {
+            (_, _, DepPlan::Fetch(DepSpec::Package(p))) => {
                 assert_eq!(p.key(), "https://gitlab.gnome.org/GNOME/glib");
             }
             other => panic!("expected a curated Fetch, got {other:?}"),
@@ -2801,7 +3330,7 @@ mod tests {
         )
         .unwrap()
         {
-            DepPlan::Missing => {}
+            (_, _, DepPlan::Missing) => {}
             other => panic!("expected Missing, got {other:?}"),
         }
         // contrast: the SAME name as a REQUIRED dependency runs the
@@ -2840,7 +3369,7 @@ mod tests {
         )
         .unwrap()
         {
-            DepPlan::Satisfied => {}
+            (_, _, DepPlan::Satisfied) => {}
             other => panic!("expected Satisfied, got {other:?}"),
         }
     }
