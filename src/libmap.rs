@@ -94,12 +94,31 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "gio-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gio module)" },
     CuratedEntry { module: "gio-unix-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gio-unix module)" },
     CuratedEntry { module: "gio-windows-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gio-windows module)" },
+    // girepository-2.0 is the same resolution category as gio-unix-2.0:
+    // a module bundled inside a parent project's repository — since GLib
+    // 2.79 the girepository library lives in GLib's own tree
+    // (glib/girepository/, which declares `meson.override_dependency(
+    // 'girepository-2.0', …)`); the standalone GObject-Introspection
+    // project pairs with it (its scanner drives GLib's introspection
+    // build) and keeps its own module, `gobject-introspection-1.0`,
+    // below. Mapping to GLib also deduplicates: a closure needing
+    // glib-2.0 AND girepository-2.0 fetches GLib once.
+    CuratedEntry { module: "girepository-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (girepository module)" },
     CuratedEntry { module: "glib-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib" },
     CuratedEntry { module: "gmodule-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gmodule module)" },
+    CuratedEntry { module: "gmodule-export-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gmodule-export module)" },
+    CuratedEntry { module: "gmodule-no-export-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gmodule-no-export module)" },
     CuratedEntry { module: "gobject-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gobject module)" },
     CuratedEntry { module: "gthread-2.0", source: "https://gitlab.gnome.org/GNOME/glib", git_ref: None, label: "GLib (gthread module)" },
     // ---- GTK family --------------------------------------------------------
+    // atk: GTK 2's accessibility bridge (cairo's optional gtk+-2.0 mapping
+    // pulls the gtk-2-24 branch, whose BASE_DEPENDENCIES include atk)
+    CuratedEntry { module: "atk", source: "https://gitlab.gnome.org/GNOME/atk", git_ref: None, label: "ATK" },
     CuratedEntry { module: "gdk-pixbuf-2.0", source: "https://gitlab.gnome.org/GNOME/gdk-pixbuf", git_ref: None, label: "GDK-Pixbuf" },
+    // gi-docgen: the GObject introspection documentation generator —
+    // a build TOOL AppStream declares `dependency(..., native: true)`
+    // under its default-ON 'apidocs' option. Ships gi-docgen.pc.
+    CuratedEntry { module: "gi-docgen", source: "https://gitlab.gnome.org/GNOME/gi-docgen", git_ref: None, label: "gi-docgen" },
     CuratedEntry { module: "gtk+-2.0", source: "https://gitlab.gnome.org/GNOME/gtk", git_ref: Some("gtk-2-24"), label: "GTK 2 (gtk-2-24 branch)" },
     CuratedEntry { module: "gtk+-3.0", source: "https://gitlab.gnome.org/GNOME/gtk", git_ref: Some("gtk-3-24"), label: "GTK 3 (gtk-3-24 branch)" },
     CuratedEntry { module: "gtk4", source: "https://gitlab.gnome.org/GNOME/gtk", git_ref: None, label: "GTK 4" },
@@ -115,12 +134,20 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "cairo-ps", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (ps backend)" },
     CuratedEntry { module: "cairo-quartz", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (quartz backend)" },
     CuratedEntry { module: "cairo-script", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (script backend)" },
+    // cairo-script-interpreter is the script backend's library module
+    // (cairo's own provide set — cf. the wrap `dependency_names` of
+    // harfbuzz's subprojects/cairo.wrap). GTK declares it with
+    // `required: false` (opportunistic reftest support): as an optional
+    // dependency it resolves through this entry silently.
+    CuratedEntry { module: "cairo-script-interpreter", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (script interpreter)" },
     CuratedEntry { module: "cairo-svg", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (svg backend)" },
     CuratedEntry { module: "cairo-win32", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (win32 backend)" },
     CuratedEntry { module: "cairo-xcb", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (xcb backend)" },
     CuratedEntry { module: "cairo-xlib", source: "https://gitlab.freedesktop.org/cairo/cairo", git_ref: None, label: "cairo (xlib backend)" },
     CuratedEntry { module: "fontconfig", source: "https://gitlab.freedesktop.org/fontconfig/fontconfig", git_ref: None, label: "fontconfig" },
     CuratedEntry { module: "freetype2", source: "https://gitlab.freedesktop.org/freetype/freetype", git_ref: None, label: "FreeType" },
+    // FriBidi: GTK's bidirectional text engine (meson upstream)
+    CuratedEntry { module: "fribidi", source: "https://github.com/fribidi/fribidi", git_ref: None, label: "FriBidi" },
     CuratedEntry { module: "harfbuzz", source: "https://github.com/harfbuzz/harfbuzz", git_ref: None, label: "HarfBuzz" },
     CuratedEntry { module: "harfbuzz-cairo", source: "https://github.com/harfbuzz/harfbuzz", git_ref: None, label: "HarfBuzz (cairo integration)" },
     CuratedEntry { module: "harfbuzz-gobject", source: "https://github.com/harfbuzz/harfbuzz", git_ref: None, label: "HarfBuzz (gobject bindings)" },
@@ -139,6 +166,11 @@ pub const CURATED: &[CuratedEntry] = &[
     // (web UI public, repository access gated) — the real upstream is the
     // GitHub repository above; verified anonymously clonable.
     CuratedEntry { module: "appstream-glib", source: "https://github.com/hughsie/appstream-glib", git_ref: None, label: "AppStream-GLib" },
+    // bash-completion: the completions-directory lookup module. AppStream
+    // gates it behind its (default-ON) 'bash-completion' option, making
+    // it genuinely required for a default build. Upstream is autotools
+    // and installs bash-completion.pc.
+    CuratedEntry { module: "bash-completion", source: "https://github.com/scop/bash-completion", git_ref: None, label: "bash-completion" },
     CuratedEntry { module: "gee-0.8", source: "https://gitlab.gnome.org/GNOME/libgee", git_ref: None, label: "libgee" },
     CuratedEntry { module: "gobject-introspection-1.0", source: "https://gitlab.gnome.org/GNOME/gobject-introspection", git_ref: None, label: "gobject-introspection" },
     CuratedEntry { module: "gsettings-desktop-schemas", source: "https://gitlab.gnome.org/GNOME/gsettings-desktop-schemas", git_ref: None, label: "gsettings-desktop-schemas" },
@@ -159,6 +191,10 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "libcurl", source: "https://github.com/curl/curl", git_ref: None, label: "libcurl" },
     CuratedEntry { module: "libffi", source: "https://github.com/libffi/libffi", git_ref: None, label: "libffi" },
     CuratedEntry { module: "libjpeg", source: "https://github.com/libjpeg-turbo/libjpeg-turbo", git_ref: None, label: "libjpeg-turbo" },
+    // libfyaml: the YAML parser AppStream reads metadata with —
+    // declared unconditionally in its top-level meson.build (a CMake
+    // upstream; ships libfyaml.pc)
+    CuratedEntry { module: "libfyaml", source: "https://github.com/pantoniou/libfyaml", git_ref: None, label: "libfyaml" },
     CuratedEntry { module: "libpng", source: "https://github.com/pnggroup/libpng", git_ref: None, label: "libpng" },
     CuratedEntry { module: "libssl", source: "https://github.com/openssl/openssl", git_ref: None, label: "OpenSSL (libssl)" },
     CuratedEntry { module: "libtiff-4", source: "https://gitlab.com/libtiff/libtiff", git_ref: None, label: "libtiff" },
@@ -169,6 +205,9 @@ pub const CURATED: &[CuratedEntry] = &[
     // the project's GitHub home is the webmproject org, and sharpyuv
     // builds from the libwebp tree itself.
     CuratedEntry { module: "libsharpyuv", source: "https://github.com/webmproject/libwebp", git_ref: None, label: "libwebp (sharpyuv)" },
+    // libzstd: AppStream's default-ON 'zstd-support' declares it
+    // unconditionally; the zstd monorepo builds it with meson
+    CuratedEntry { module: "libzstd", source: "https://github.com/facebook/zstd", git_ref: None, label: "zstd" },
     CuratedEntry { module: "openssl", source: "https://github.com/openssl/openssl", git_ref: None, label: "OpenSSL" },
     CuratedEntry { module: "sqlite3", source: "https://github.com/sqlite/sqlite", git_ref: None, label: "SQLite" },
     CuratedEntry { module: "zlib", source: "https://github.com/madler/zlib", git_ref: None, label: "zlib" },
@@ -177,6 +216,16 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "epoxy", source: "https://github.com/anholt/libepoxy", git_ref: None, label: "libepoxy" },
     CuratedEntry { module: "graphene-1.0", source: "https://github.com/ebassi/graphene", git_ref: None, label: "graphene" },
     CuratedEntry { module: "graphene-gles2", source: "https://github.com/ebassi/graphene", git_ref: None, label: "graphene (gles2)" },
+    // ---- GStreamer family (one monorepo, many modules) --------------------
+    // Every gstreamer-* pkg-config module is built from the GStreamer
+    // monorepo (core + gst-plugins-*). GTK's media backend is a
+    // default-enabled feature that declares the play/gl/allocators
+    // modules; all family members deduplicate to ONE clone/build.
+    CuratedEntry { module: "gstreamer-1.0", source: "https://gitlab.freedesktop.org/gstreamer/gstreamer", git_ref: None, label: "GStreamer" },
+    CuratedEntry { module: "gstreamer-allocators-1.0", source: "https://gitlab.freedesktop.org/gstreamer/gstreamer", git_ref: None, label: "GStreamer (allocators module)" },
+    CuratedEntry { module: "gstreamer-gl-1.0", source: "https://gitlab.freedesktop.org/gstreamer/gstreamer", git_ref: None, label: "GStreamer (gl module)" },
+    CuratedEntry { module: "gstreamer-play-1.0", source: "https://gitlab.freedesktop.org/gstreamer/gstreamer", git_ref: None, label: "GStreamer (play module)" },
+    CuratedEntry { module: "gstreamer-tag-1.0", source: "https://gitlab.freedesktop.org/gstreamer/gstreamer", git_ref: None, label: "GStreamer (tag module)" },
     CuratedEntry { module: "libdrm", source: "https://gitlab.freedesktop.org/mesa/drm", git_ref: None, label: "libdrm" },
     CuratedEntry { module: "libdrm_amdgpu", source: "https://gitlab.freedesktop.org/mesa/drm", git_ref: None, label: "libdrm (amdgpu)" },
     CuratedEntry { module: "libdrm_intel", source: "https://gitlab.freedesktop.org/mesa/drm", git_ref: None, label: "libdrm (intel)" },
@@ -194,9 +243,24 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "wayland-egl-backend", source: "https://gitlab.freedesktop.org/wayland/wayland", git_ref: None, label: "libwayland (egl-backend)" },
     CuratedEntry { module: "wayland-scanner", source: "https://gitlab.freedesktop.org/wayland/wayland", git_ref: None, label: "libwayland (scanner tool)" },
     CuratedEntry { module: "wayland-server", source: "https://gitlab.freedesktop.org/wayland/wayland", git_ref: None, label: "libwayland (server)" },
+    // ---- X11 client libraries (one repo per module, xorg/lib/<name>) -----
+    // the pkg-config names GTK's default-enabled x11 backend requires
+    CuratedEntry { module: "x11", source: "https://gitlab.freedesktop.org/xorg/lib/libx11", git_ref: None, label: "libX11" },
+    CuratedEntry { module: "xcb", source: "https://gitlab.freedesktop.org/xorg/lib/libxcb", git_ref: None, label: "libxcb" },
+    CuratedEntry { module: "xcursor", source: "https://gitlab.freedesktop.org/xorg/lib/libxcursor", git_ref: None, label: "libXcursor" },
+    CuratedEntry { module: "xdamage", source: "https://gitlab.freedesktop.org/xorg/lib/libxdamage", git_ref: None, label: "libXdamage" },
+    CuratedEntry { module: "xext", source: "https://gitlab.freedesktop.org/xorg/lib/libxext", git_ref: None, label: "libXext" },
+    CuratedEntry { module: "xfixes", source: "https://gitlab.freedesktop.org/xorg/lib/libxfixes", git_ref: None, label: "libXfixes" },
+    CuratedEntry { module: "xi", source: "https://gitlab.freedesktop.org/xorg/lib/libxi", git_ref: None, label: "libXi" },
+    CuratedEntry { module: "xinerama", source: "https://gitlab.freedesktop.org/xorg/lib/libxinerama", git_ref: None, label: "libXinerama" },
+    CuratedEntry { module: "xrandr", source: "https://gitlab.freedesktop.org/xorg/lib/libxrandr", git_ref: None, label: "libXrandr" },
+    CuratedEntry { module: "xrender", source: "https://gitlab.freedesktop.org/xorg/lib/libxrender", git_ref: None, label: "libXrender" },
     CuratedEntry { module: "xkbcommon", source: "https://github.com/xkbcommon/libxkbcommon", git_ref: None, label: "libxkbcommon" },
     CuratedEntry { module: "xkbcommon-x11", source: "https://github.com/xkbcommon/libxkbcommon", git_ref: None, label: "libxkbcommon (x11)" },
     CuratedEntry { module: "xkbregistry", source: "https://github.com/xkbcommon/libxkbcommon", git_ref: None, label: "libxkbcommon (registry)" },
+    // ---- graphics loaders / APIs -------------------------------------------
+    // the Vulkan loader behind GTK's vulkan renderer
+    CuratedEntry { module: "vulkan", source: "https://github.com/KhronosGroup/Vulkan-Loader", git_ref: None, label: "Vulkan-Loader" },
 ];
 
 /// Look up a module name (already normalized to lowercase by the
@@ -311,15 +375,59 @@ mod tests {
     fn same_source_families_exist_for_dedup() {
         // the dedup precondition: several module names -> one repo
         for family in [
-            &["glib-2.0", "gio-2.0", "gio-unix-2.0", "gobject-2.0"][..],
-            &["cairo", "cairo-gobject", "cairo-svg"][..],
+            &["glib-2.0", "gio-2.0", "gio-unix-2.0", "gobject-2.0", "girepository-2.0"][..],
+            &["cairo", "cairo-gobject", "cairo-svg", "cairo-script-interpreter"][..],
             &["wayland-client", "wayland-server", "wayland-scanner"][..],
             &["harfbuzz", "harfbuzz-subset", "harfbuzz-icu"][..],
             &["openssl", "libssl", "libcrypto"][..],
             &["libwebp", "libsharpyuv"][..],
+            &["gstreamer-1.0", "gstreamer-play-1.0", "gstreamer-gl-1.0", "gstreamer-allocators-1.0", "gstreamer-tag-1.0"][..],
         ] {
             assert_eq!(distinct_sources(family).len(), 1, "{family:?}");
         }
+    }
+
+    /// The dependency list from the second ProtonPlus round — the run
+    /// that motivated the required/optional semantics fix. girepository-2.0
+    /// is the gio-unix-2.0 category (module inside a parent repo: GLib's
+    /// own tree since 2.79 — NOT a new special case); cairo-script-interpreter
+    /// is a cairo module; the gstreamer-* modules are the default-enabled
+    /// GTK media backend; bash-completion is AppStream's default-ON
+    /// completions-dir lookup. Again: a fixture, and NONE of these names
+    /// may be special-cased anywhere in planner/search code.
+    #[test]
+    fn validation_list_from_the_optional_semantics_run_resolves_via_curated_map() {
+        let list = [
+            "bash-completion",
+            "cairo-script-interpreter",
+            "girepository-2.0",
+            "gstreamer-allocators-1.0",
+            "gstreamer-gl-1.0",
+            "gstreamer-play-1.0",
+            // the third round (AppStream's own default-on requirements):
+            // gi-docgen (apidocs, native tool), libfyaml (unconditional),
+            // libzstd (zstd-support)
+            "gi-docgen",
+            "libfyaml",
+            "libzstd",
+        ];
+        for name in list {
+            assert!(lookup(name).is_some(), "`{name}` missing from curated map");
+        }
+        // girepository-2.0 shares GLib's source exactly like gio-unix-2.0
+        assert_eq!(
+            lookup("girepository-2.0").map(|e| e.source),
+            lookup("gio-unix-2.0").map(|e| e.source)
+        );
+        // the gstreamer family collapses to ONE monorepo source
+        let gst = distinct_sources(&[
+            "gstreamer-1.0",
+            "gstreamer-play-1.0",
+            "gstreamer-gl-1.0",
+            "gstreamer-allocators-1.0",
+            "gstreamer-tag-1.0",
+        ]);
+        assert_eq!(gst.len(), 1, "{gst:?}");
     }
 
     /// The generic-remote contract of this table: every source must be

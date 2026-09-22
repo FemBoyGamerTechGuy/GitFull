@@ -298,19 +298,32 @@ fn build_commands(bs: crate::manifest::BuildSystem, sb: &Sandbox, jobs: usize) -
     let build = sb.build().display().to_string();
     let prefix = sb.prefix().display().to_string();
     match bs {
-        Autotools => vec![
-            s(
-                "configure",
-                vec![format!("{src}/configure"), format!("--prefix={prefix}")],
-                sb.build(),
-            ),
-            s(
-                "build",
-                vec!["make".into(), format!("-j{jobs}")],
-                sb.build(),
-            ),
-            s("install", vec!["make".into(), "install".into()], sb.build()),
-        ],
+        Autotools => {
+            let mut steps = Vec::new();
+            // a git checkout of an autotools project ships configure.ac
+            // without the generated script (only release tarballs carry
+            // it) — bootstrap the autotools chain first
+            if !sb.src().join("configure").is_file()
+                && (sb.src().join("configure.ac").is_file()
+                    || sb.src().join("configure.in").is_file())
+            {
+                steps.push(s(
+                    "autoreconf",
+                    vec!["autoreconf".into(), "-fi".into()],
+                    sb.src(),
+                ));
+            }
+            steps.extend([
+                s(
+                    "configure",
+                    vec![format!("{src}/configure"), format!("--prefix={prefix}")],
+                    sb.build(),
+                ),
+                s("build", vec!["make".into(), format!("-j{jobs}")], sb.build()),
+                s("install", vec!["make".into(), "install".into()], sb.build()),
+            ]);
+            steps
+        }
         Make => vec![
             s("build", vec!["make".into(), format!("-j{jobs}")], sb.src()),
             s(
@@ -633,9 +646,14 @@ enum Fetch {
     Local {
         path: PathBuf,
     },
-    /// meson `[wrap-file]`: source tarball (+ optional patch).
+    /// meson `[wrap-file]`: source tarball (+ optional wrapdb fallback
+    /// and patch).
     Tarball {
         url: String,
+        /// `source_fallback_url` — meson's own secondary mirror (the
+        /// wrapdb GitHub release), tried when the primary 403s/404s
+        /// (e.g. www.freedesktop.org software server refusals).
+        fallback_url: Option<String>,
         patch_url: Option<String>,
     },
 }
@@ -703,6 +721,12 @@ enum DepPlan {
     /// confirmation (TTY) or fail with a pin hint; `--dry-run` reports
     /// it as unresolved and skips the subtree.
     Unconfirmed(Vec<search::Candidate>),
+    /// No layer resolved — and no search was attempted. Only returned
+    /// for OPTIONAL dependencies (see [`plan_declared_dep`]'s
+    /// `allow_search`): an optional dependency must never prompt or
+    /// block, so the ranked-search fallback is deliberately skipped
+    /// and the caller logs "not available — continuing without it".
+    Missing,
 }
 
 /// Plan one manifest-declared dependency through the resolution layers
@@ -713,7 +737,9 @@ enum DepPlan {
 /// 2. user `[dep.<name>]` override (`skip`, or a pinned `source`) —
 ///    user configuration always wins, including over the curated map;
 /// 3. meson wraps (the manifest's own pin files — git/file);
-/// 4. vendored subprojects (checked-in trees under `subprojects/`);
+/// 4. vendored subprojects (checked-in trees under `subprojects/`),
+///    and modules the tree's own build *provides*
+///    (`meson.override_dependency` declarations);
 /// 5. the shared library cache, matched by provided names;
 /// 6. the **curated upstream map** ([`crate::libmap`]) — well-known
 ///    pkg-config module names → their correct upstream repository.
@@ -725,12 +751,20 @@ enum DepPlan {
 /// 7. ranked forge search — **flagged fallback only**: candidates are
 ///    returned unconfirmed ([`DepPlan::Unconfirmed`]) and must never be
 ///    silently auto-built.
+///
+/// `allow_search` gates layer 7. REQUIRED dependencies always search
+/// (an unconfirmed candidate is better than nothing: the install stops
+/// for a pin or a TTY confirmation). OPTIONAL dependencies
+/// (`required: false`, feature options in `'auto'`) pass `false` — an
+/// unresolved optional dependency is logged and skipped, NEVER
+/// prompted for: the project itself builds fine without it.
 fn plan_declared_dep(
     cfg: &Config,
     ctx: &ExecCtx,
     cache: &LibCache,
     declared: &DeclaredDeps,
     d: &DeclaredDep,
+    allow_search: bool,
 ) -> Result<DepPlan> {
     if d.kind == crate::depgraph::DepKind::CrateRegistry {
         println!(
@@ -762,11 +796,21 @@ fn plan_declared_dep(
             return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
         }
     }
-    // meson wraps: the manifest's own pin for this name wins over search
+    // meson wraps: the manifest's own pin for this name wins over
+    // search — matched by the wrap's name, its [provide] module names,
+    // OR the dependency's own `fallback: ['<subproject>', …]` kwarg
+    // (meson's fallback semantics name the subproject explicitly)
     if let Some(w) = declared
         .wraps
         .iter()
-        .find(|w| w.name.to_ascii_lowercase() == d.name_norm || w.provides.iter().any(|p| p.to_ascii_lowercase() == d.name_norm))
+        .find(|w| {
+            w.name.to_ascii_lowercase() == d.name_norm
+                || w.provides.iter().any(|p| p.to_ascii_lowercase() == d.name_norm)
+                || d.fallback_subproject
+                    .as_deref()
+                    .map(|f| w.name.eq_ignore_ascii_case(f))
+                    .unwrap_or(false)
+        })
     {
         if let Some(git) = &w.git {
             println!(
@@ -792,6 +836,20 @@ fn plan_declared_dep(
     {
         println!(
             "gitfull: dep `{}`: vendored subproject in-tree — nothing to fetch",
+            d.name
+        );
+        return Ok(DepPlan::Satisfied);
+    }
+    // a module the tree's own build provides (meson.override_dependency):
+    // building THIS tree already satisfies it — nothing to fetch
+    if declared
+        .provided_in_tree
+        .iter()
+        .any(|p| p == &d.name_norm)
+    {
+        println!(
+            "gitfull: dep `{}`: provided by this project's own build \
+             (meson.override_dependency) — nothing to fetch",
             d.name
         );
         return Ok(DepPlan::Satisfied);
@@ -826,6 +884,14 @@ fn plan_declared_dep(
             entry.label
         );
         return identity_or_fetch(cfg, cache, &d.name_norm, DepSpec::Package(spec));
+    }
+    if !allow_search {
+        // an OPTIONAL dependency with no sound source: not available —
+        // the caller logs it and continues. Never searched (an
+        // unconfirmed candidate would be useless: prompting for an
+        // optional dependency is forbidden, and auto-building an
+        // unconfirmed match is forbidden for every dependency).
+        return Ok(DepPlan::Missing);
     }
     // ranked forge search: FLAGGED FALLBACK — candidates only, never an
     // auto-selected build (see DepPlan::Unconfirmed)
@@ -872,7 +938,11 @@ fn identity_or_fetch(
 /// Print the dependency-scan summary for one source tree.
 fn print_dep_scan(declared: &DeclaredDeps) {
     let req = declared.required_names();
-    if req.is_empty() && declared.wraps.is_empty() && declared.optional.is_empty() {
+    if req.is_empty()
+        && declared.wraps.is_empty()
+        && declared.optional.is_empty()
+        && declared.provided_in_tree.is_empty()
+    {
         println!("gitfull: no declared library dependencies found");
         return;
     }
@@ -890,9 +960,14 @@ fn print_dep_scan(declared: &DeclaredDeps) {
     }
     for d in &declared.optional {
         println!(
-            "gitfull:   dep {} ({}; optional per the manifest — reported, \
-             not provisioned)",
-            d.name, d.kind.label()
+            "gitfull:   dep {} ({}; optional{} — resolved silently when a \
+             sound source exists, never blocking)",
+            d.name,
+            d.kind.label(),
+            d.optional_why
+                .as_deref()
+                .map(|w| format!(": {w}"))
+                .unwrap_or_default()
         );
     }
 }
@@ -934,14 +1009,33 @@ fn fetch_dep_source(
             copy_tree(path, &node_sb.src())?;
             Ok(None)
         }
-        Fetch::Tarball { url, patch_url } => {
+        Fetch::Tarball { url, fallback_url, patch_url } => {
             // [wrap-file]: download the pinned tarball, extract (lifting a
-            // single top-level directory), optionally apply the wrap patch
+            // single top-level directory), optionally apply the wrap patch.
+            // The primary URL failing (upstream server refusals are real:
+            // www.freedesktop.org 403s from some networks) falls back to
+            // the wrap's own `source_fallback_url` — exactly what meson
+            // does — before giving up.
             let digest = crate::sha256::sha256_hex(url.as_bytes());
             let name = util::sanitize_component(&digest[..16.min(digest.len())]);
             let tarball = cfg.cache_dir.join(format!("dep-{name}.tar"));
             println!("gitfull: downloading {url}");
-            gitproc::curl_download(fetch_ctx, url, &tarball, &cfg.host_tool_path)?;
+            let downloaded =
+                gitproc::curl_download(fetch_ctx, url, &tarball, &cfg.host_tool_path);
+            let dl_result = match downloaded {
+                Ok(()) => Ok(()),
+                Err(primary_err) => match fallback_url {
+                    Some(f) => {
+                        println!(
+                            "gitfull: primary tarball URL failed ({primary_err}) — trying \
+                             the wrap's source_fallback_url {f}"
+                        );
+                        gitproc::curl_download(fetch_ctx, f, &tarball, &cfg.host_tool_path)
+                    }
+                    None => Err(primary_err),
+                },
+            };
+            dl_result?;
             let extract_dir = node_sb.dir.join(".extract");
             if extract_dir.exists() {
                 fs::remove_dir_all(&extract_dir)?;
@@ -1014,6 +1108,7 @@ fn is_ancestor(nodes: &[DepNode], ancestor_idx: usize, of_idx: usize) -> bool {
 }
 
 /// A queued dependency edge (parent node index + how to fetch it).
+#[derive(Debug)]
 struct QueuedDep {
     spec: DepSpec,
     parent: usize,
@@ -1088,13 +1183,14 @@ fn plan_dep_fetch(cfg: &Config, spec: &DepSpec) -> Result<PlannedFetch> {
             })
         }
         DepSpec::WrapFile(w) => {
-            let (url_s, patch) = w
+            let (url_s, fallback, patch) = w
                 .file
                 .clone()
                 .expect("internal: WrapFile queued without a url");
             Ok(PlannedFetch {
                 fetch: Fetch::Tarball {
                     url: url_s.clone(),
+                    fallback_url: fallback,
                     patch_url: patch,
                 },
                 key: format!("wrap:{}", w.name),
@@ -1200,18 +1296,57 @@ fn read_stdin_line() -> Option<String> {
     std::io::stdin().read_line(&mut line).ok().map(|_| line)
 }
 
+/// Expand a shared-cache hit into the FULL link closure (the entry
+/// plus every entry it was built against) as linkable dirs.
+fn push_cache_hit_closure(
+    cache: &LibCache,
+    dir: &PathBuf,
+    fallback_name: &str,
+    hits: &mut Vec<(String, PathBuf)>,
+) {
+    let key = dir
+        .file_name()
+        .map(|k| k.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for cdir in cache.closure_dirs(&key) {
+        if hits.iter().any(|(_, d)| d == &cdir) {
+            continue;
+        }
+        let name = cache
+            .entry_meta(
+                &cdir
+                    .file_name()
+                    .map(|k| k.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+            .map(|m| m.name)
+            .unwrap_or_else(|| fallback_name.to_string());
+        hits.push((name, cdir));
+    }
+}
+
 /// Plan every declared dependency of one scanned tree: adds fetches to
 /// the walk queue, returns shared-cache hits as `(name, dir)` pairs.
+///
+/// REQUIRED dependencies go through every layer INCLUDING the flagged
+/// ranked-search fallback (`Unconfirmed` → interactive confirmation or
+/// a pin-hint failure; `--dry-run` reports and skips the subtree).
+///
+/// OPTIONAL dependencies (meson `required: false`, feature options in
+/// `'auto'`, ...) run the same SOUND layers — user pin, wrap, vendored
+/// tree, in-tree provides, shared cache, curated map — silently: a
+/// resolved optional dependency is provisioned (opportunistically:
+/// "use it if present" is exactly what the manifest asked for), but an
+/// unresolved one is logged as not-available and the install continues.
+/// The search fallback is never entered for an optional dependency: its
+/// result would be unconfirmed, and an optional dependency must never
+/// prompt, block, or auto-build an unconfirmed match.
 ///
 /// Wraps that no `dependency()` call references are still fetched — the
 /// same policy `meson subprojects download` uses: a wrap file is the
 /// project's own pin, and honoring it can only over-provide, never
 /// under-provide. (Vendored in-tree subprojects are excluded here — they
 /// need no fetch.)
-///
-/// `dry_run` only changes how an **unconfirmed** search fallback is
-/// handled: a real install must confirm (TTY) or fail (pin hint), while
-/// a dry run reports the dep as unresolved and skips its subtree.
 fn plan_scan(
     cfg: &Config,
     ctx: &ExecCtx,
@@ -1227,30 +1362,10 @@ fn plan_scan(
         .iter()
         .filter(|d| d.kind != crate::depgraph::DepKind::CrateRegistry)
     {
-        match plan_declared_dep(cfg, ctx, cache, scan, d)? {
+        match plan_declared_dep(cfg, ctx, cache, scan, d, true)? {
             DepPlan::Satisfied => {}
             DepPlan::CacheHit(dir) => {
-                // the hit entry AND its link closure (the entries it was
-                // built against) must all be linkable by the dependent
-                let key = dir
-                    .file_name()
-                    .map(|k| k.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                for cdir in cache.closure_dirs(&key) {
-                    if hits.iter().any(|(_, d)| d == &cdir) {
-                        continue;
-                    }
-                    let name = cache
-                        .entry_meta(
-                            &cdir
-                                .file_name()
-                                .map(|k| k.to_string_lossy().to_string())
-                                .unwrap_or_default(),
-                        )
-                        .map(|m| m.name)
-                        .unwrap_or_else(|| d.name.clone());
-                    hits.push((name, cdir));
-                }
+                push_cache_hit_closure(cache, &dir, &d.name, &mut hits);
             }
             DepPlan::Fetch(spec) => queue.push_back(QueuedDep {
                 spec,
@@ -1288,6 +1403,42 @@ fn plan_scan(
                     });
                 }
             }
+            // search is always allowed for required deps — unreachable
+            DepPlan::Missing => {}
+        }
+    }
+    // optional dependencies: same sound layers, silently; never search,
+    // never prompt, never block
+    for d in scan
+        .optional
+        .iter()
+        .filter(|d| d.kind != crate::depgraph::DepKind::CrateRegistry)
+    {
+        match plan_declared_dep(cfg, ctx, cache, scan, d, false)? {
+            DepPlan::Satisfied => {}
+            DepPlan::CacheHit(dir) => {
+                push_cache_hit_closure(cache, &dir, &d.name, &mut hits);
+            }
+            DepPlan::Fetch(spec) => queue.push_back(QueuedDep {
+                spec,
+                parent,
+                declared: Some(d.name.clone()),
+                name_norm: Some(d.name_norm.clone()),
+                cache_name: d.name_norm.clone(),
+            }),
+            // unresolved optional dependency: log and continue — the
+            // project itself builds fine without it
+            DepPlan::Missing => println!(
+                "gitfull: optional dependency `{}` not available — continuing \
+                 without it{}",
+                d.name,
+                d.optional_why
+                    .as_deref()
+                    .map(|w| format!(" ({w})"))
+                    .unwrap_or_default()
+            ),
+            // unreachable: no search is attempted for optional deps
+            DepPlan::Unconfirmed(_) => {}
         }
     }
     for w in &scan.wraps {
@@ -2267,14 +2418,20 @@ mod tests {
     }
 
     fn dep(name: &str) -> DeclaredDep {
+        dep_opt(name, true)
+    }
+
+    fn dep_opt(name: &str, required: bool) -> DeclaredDep {
         DeclaredDep {
             name: name.to_string(),
             name_norm: name.to_ascii_lowercase(),
             kind: crate::depgraph::DepKind::PkgConfig,
-            required: true,
+            required,
+            optional_why: (!required).then(|| "test fixture".to_string()),
             version: None,
             origin: "test".to_string(),
             git_url: None,
+            fallback_subproject: None,
         }
     }
 
@@ -2298,7 +2455,7 @@ mod tests {
             ("gee-0.8", "https://gitlab.gnome.org/GNOME/libgee"),
             ("sdl3", "https://github.com/libsdl-org/SDL"),
         ] {
-            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name)).unwrap() {
+            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name), true).unwrap() {
                 DepPlan::Fetch(DepSpec::Package(p)) => {
                     assert_eq!(
                         p.key(),
@@ -2318,7 +2475,7 @@ mod tests {
         let cfg = test_cfg(None);
         let cache = empty_cache(&cfg);
         let declared = crate::depgraph::DeclaredDeps::default();
-        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("sdl2")).unwrap() {
+        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("sdl2"), true).unwrap() {
             DepPlan::Fetch(DepSpec::Package(p)) => {
                 assert_eq!(p.key(), "https://github.com/libsdl-org/SDL");
                 assert_eq!(p.git_ref.as_deref(), Some("SDL2"));
@@ -2335,7 +2492,7 @@ mod tests {
         let cfg = test_cfg(Some(extra));
         let cache = empty_cache(&cfg);
         let declared = crate::depgraph::DeclaredDeps::default();
-        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("cairo")).unwrap() {
+        match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep("cairo"), true).unwrap() {
             DepPlan::Fetch(DepSpec::Package(p)) => {
                 assert_eq!(p.key(), "myorg/my-cairo-fork");
                 assert_eq!(p.git_ref.as_deref(), Some("stable"));
@@ -2354,7 +2511,7 @@ mod tests {
         let declared = crate::depgraph::DeclaredDeps::default();
         let mut identities = BTreeSet::new();
         for name in ["glib-2.0", "gio-unix-2.0", "gobject-2.0", "gio-2.0"] {
-            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name)).unwrap() {
+            match plan_declared_dep(&cfg, &ctx(&cfg), &cache, &declared, &dep(name), true).unwrap() {
                 DepPlan::Fetch(DepSpec::Package(p)) => {
                     let planned = plan_dep_fetch(&cfg, &DepSpec::Package(p)).unwrap();
                     identities.insert(planned.identity);
@@ -2572,5 +2729,152 @@ mod tests {
             Some(("group/sub".to_string(), "libtiff".to_string()))
         );
         assert_eq!(parse_git_url_owner_repo("https://example.com"), None);
+    }
+
+    // ---- optional dependencies: silent resolution, never a prompt ---------
+
+    /// An optional dependency with a curated mapping resolves through the
+    /// curated map — silently and WITHOUT touching ranked search (the
+    /// fake forges are unreachable; a search attempt would fail here).
+    /// This is the GTK `cairo-script-interpreter` case: optional per the
+    /// manifest, provisioned opportunistically because a sound source
+    /// exists.
+    #[test]
+    fn optional_dep_resolves_through_curated_map_without_search() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_opt("cairo-script-interpreter", false),
+            false,
+        )
+        .unwrap()
+        {
+            DepPlan::Fetch(DepSpec::Package(p)) => {
+                assert_eq!(
+                    p.key(),
+                    "https://gitlab.freedesktop.org/cairo/cairo",
+                    "optional deps still resolve through the curated map"
+                );
+            }
+            other => panic!("expected a curated Fetch, got {other:?}"),
+        }
+        // girepository-2.0, the gio-unix-2.0 category: same family
+        // dedup applies for optional deps too
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_opt("girepository-2.0", false),
+            false,
+        )
+        .unwrap()
+        {
+            DepPlan::Fetch(DepSpec::Package(p)) => {
+                assert_eq!(p.key(), "https://gitlab.gnome.org/GNOME/glib");
+            }
+            other => panic!("expected a curated Fetch, got {other:?}"),
+        }
+    }
+
+    /// An optional dependency with NO sound source is MISSING — not
+    /// unconfirmed, not an error. The ranked-search fallback is never
+    /// entered (allow_search = false), so no candidate list exists that
+    /// could prompt a user or be auto-built.
+    #[test]
+    fn optional_dep_without_source_is_missing_not_unconfirmed() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let declared = crate::depgraph::DeclaredDeps::default();
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep_opt("no-such-module-xyz", false),
+            false,
+        )
+        .unwrap()
+        {
+            DepPlan::Missing => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        // contrast: the SAME name as a REQUIRED dependency runs the
+        // search fallback (which fails here — the fake forges are
+        // unreachable) — the layers differ exactly at the search step
+        assert!(
+            plan_declared_dep(
+                &cfg,
+                &ctx(&cfg),
+                &cache,
+                &declared,
+                &dep("no-such-module-xyz"),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    /// A module the scanned tree itself provides
+    /// (`meson.override_dependency`) is Satisfied — the GLib
+    /// girepository-2.0 case: building the tree already builds the
+    /// module; nothing may be fetched for it.
+    #[test]
+    fn provided_in_tree_module_is_satisfied_without_fetch() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let mut declared = crate::depgraph::DeclaredDeps::default();
+        declared.provided_in_tree.push("girepository-2.0".to_string());
+        match plan_declared_dep(
+            &cfg,
+            &ctx(&cfg),
+            &cache,
+            &declared,
+            &dep("girepository-2.0"),
+            true,
+        )
+        .unwrap()
+        {
+            DepPlan::Satisfied => {}
+            other => panic!("expected Satisfied, got {other:?}"),
+        }
+    }
+
+    /// End-to-end at the plan_scan level: an optional dependency that
+    /// resolves nothing is logged and SKIPPED — the scan plans on
+    /// without error, without queueing anything for it, and without
+    /// ever consulting search (which would fail against the fake
+    /// forges). A curated optional dep IS queued.
+    #[test]
+    fn plan_scan_continues_past_unresolved_optional_deps() {
+        let cfg = test_cfg(None);
+        let cache = empty_cache(&cfg);
+        let ctx = ctx(&cfg);
+        let mut scan = crate::depgraph::DeclaredDeps::default();
+        scan.optional.push(dep_opt("no-such-module-xyz", false));
+        scan.optional.push(dep_opt("cairo-script-interpreter", false));
+        let mut queue = VecDeque::new();
+        let hits = plan_scan(&cfg, &ctx, &cache, &scan, 0, &mut queue, true).unwrap();
+        assert!(hits.is_empty());
+        // exactly the curated one is queued; the unresolved one is
+        // merely logged (println — not asserted here) and skipped
+        assert_eq!(queue.len(), 1, "{queue:?}");
+        // ...and a REQUIRED unknown dep in the same scan still reaches
+        // the search fallback (which errors against the unreachable
+        // fake forges) instead of vanishing silently — optional and
+        // required deps differ exactly at that step
+        let mut scan2 = crate::depgraph::DeclaredDeps::default();
+        scan2.required.push(dep("no-such-module-xyz"));
+        let mut queue2 = VecDeque::new();
+        assert!(
+            plan_scan(&cfg, &ctx, &cache, &scan2, 0, &mut queue2, true).is_err(),
+            "required unknown deps still run the (failing, fake-forge) search"
+        );
+        assert!(queue2.is_empty());
     }
 }

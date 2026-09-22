@@ -300,8 +300,23 @@ evaluates to false** for the scan platform:
   variables holding them (`host_system = host_machine.system()`),
   boolean/string/array literals, `and`/`or`/`not` (three-valued:
   `False and …` is false; anything undecidable is *possibly true*),
-  `in`/`not in` and `.contains()` over arrays, `if`/`elif`/`else`/
-  `endif` nesting, comments, multi-line `'''…'''` probe strings;
+  `in`/`not in` and `.contains()` over arrays, ternaries
+  (`cond ? a : b` — libxml2's `want_x` chains), `if`/`elif`/`else`/
+  `endif` nesting, comments, multi-line `'''…'''` probe strings, and
+  `\` line-continuations;
+* **project options resolve against their declared defaults** —
+  `meson.options`/`meson_options.txt` option definitions plus
+  `project(default_options: […])` overlays are loaded per project, and
+  `get_option('x')` evaluates to the option's *default* (the
+  0-configuration build gitfull provisions): booleans to `true`/`false`,
+  feature options to `'enabled'`/`'disabled'`/`'auto'` (with the
+  `.enabled()/.disabled()/.auto()/.allowed()` predicates and
+  `.disable_auto()/.enable_auto()/.require()` coercions meson defines
+  on them), string/combo options to their default. A default-`false`
+  option gate (`if get_option('docs')` … `subdir('docs/')`) is a
+  provably-dead branch: the subtree is excluded. Builtin meson options
+  (`prefix`, `warning_level`, …) and undeclared names stay unknown →
+  reachable (the one-sided rule);
 * `subdir()` runs in the caller's variable scope in call order (meson
   semantics) — the evaluator follows statically-known `subdir()`
   targets with one shared scope, which is how real projects gate
@@ -311,12 +326,26 @@ evaluates to false** for the scan platform:
   never take effect — dead-branch reassignments cannot leak
   (`host_system = 'darwin'` inside `if host_system == 'ios'` stays
   Linux on Linux, and applies on iOS, exactly like meson);
-* everything statically undecidable — `get_option(...)`, compiler
-  probes, dynamic subdir paths — counts as reachable (both sides of an
-  undecided branch). Under-provisioning a real dependency breaks the
-  build; over-including an undecided one costs a report line. Files
-  not reachable through static `subdir()` calls (dynamic paths,
-  foreach-driven subdirs) are still scanned with an isolated scope.
+* **`foreach VAR : [literal list]` loops are unrolled per item** —
+  backend/plugin dispatch (GTK's
+  `foreach backend : […]
+  if get_variable('@0@_enabled'.format(backend)) → subdir(backend)`)
+  evaluates per item: live backends are entered, provably-disabled
+  ones are not. `get_variable('name')` resolves against the live
+  variable scope; `'@0@'.format(x)` performs the string interpolation
+  the dispatch idiom composes names with;
+* a `subdir()` inside a provably-dead branch records its whole
+  **directory** as never-entered: the fallback scan (below) skips
+  everything under it — an option-gated component
+  (`if get_option('compose') subdir('compose/')` with a default-off
+  option) or a dead foreach-dispatch item drops out of the scan
+  entirely, instead of being resurrected by the fallback;
+* everything statically undecidable — compiler probes, dynamic subdir
+  paths, computed option values — counts as reachable (both sides of
+  an undecided branch). Under-provisioning a real dependency breaks
+  the build; over-including an undecided one costs a report line.
+  Files not reachable through static `subdir()` calls (dynamic paths)
+  are still scanned with an isolated scope.
 
 The exclusion is provably **not name-based**: the test suite scans
 the same fixtures as several platforms and asserts a gated dependency
@@ -344,6 +373,57 @@ shapes`, plus per-build-system fixtures that share no names with each
 other), and the end-to-end tests drive discovery through fixture repos
 whose names are chosen to be obviously synthetic.
 
+### Required vs optional — meson's own semantics, read structurally
+
+A `dependency()` call carries meson's own optionality verdicts, and the
+scanner reads them from the call site (never from names):
+
+* **`required:` keyword** — `required: false` is best-effort (the
+  project checks `.found()` and carries on); `required: true` or no
+  `required:` (the default) is mandatory. The value is evaluated as a
+  full meson expression: literals, `required: get_option('x')`
+  resolved against the option's declared default, feature coercions
+  (`get_option('x').disable_auto()`), and variables assigned just
+  above the call (`gssapi_opt = get_option('gssapi')` → `required:
+  gssapi_opt`, evaluated against the live-scope snapshot at the call
+  site). A feature option resolving `'disabled'` **skips the lookup
+  entirely** — the call is not a dependency of this configuration at
+  all (same category as a platform-gated call in a dead branch);
+  `'auto'` maps to best-effort; `'enabled'` to mandatory. Undecidable
+  values stay mandatory (the one-sided rule).
+* **option gates** — a call inside `if get_option('docs')` where the
+  option defaults off is in a provably-dead branch: not surfaced at
+  all (see conditional context above).
+* **`meson.override_dependency('mod', dep)`** — the mirror image of a
+  dependency declaration: the scanned tree's own build *provides* the
+  module (GLib's tree provides `girepository-2.0`). The scanner
+  records it as an in-tree provide, never as a requirement; a sibling
+  `dependency('girepository-2.0')` call is satisfied by building the
+  same tree. `declare_dependency(...)` and other
+  `X.something_dependency(...)` method-call forms are never read as
+  the global `dependency()` declaration, and `dependency(` inside
+  string literals or `#` comments is string content, not a call.
+* **autotools equivalents** — `PKG_CHECK_MODULES(VAR, mods, found,
+  not-found)` and `AC_CHECK_LIB(lib, func, found, not-found)` with a
+  non-empty not-found handler are the optional forms; m4 `dnl`
+  comments inside multi-line argument lists are stripped; the classic
+  libc socket fallbacks (`nsl`, `socket`, `inet`) and `iconv` resolve
+  against the toolchain's C library.
+
+The planner treats the two classes differently: **required**
+dependencies run the full resolution layer stack including the flagged
+search fallback (an unconfirmed candidate stops the install for a pin
+or a TTY confirmation). **Optional** dependencies run the same *sound*
+layers silently — user pin, wrap, vendored tree, in-tree provide,
+shared cache, curated map — and a resolved optional dependency is
+provisioned opportunistically ("use it if present" is exactly what the
+manifest asked for); an unresolved one is logged
+(`optional dependency <name> not available — continuing without it`)
+and the install continues. The ranked-search fallback is never entered
+for an optional dependency: its result would be unconfirmed, and an
+optional dependency must never prompt, block, or auto-build an
+unconfirmed match.
+
 ### Resolution layers (per declared dependency)
 
 Every discovered dependency name is resolved through the same generic
@@ -361,10 +441,19 @@ layers, in order:
    rebuild.
 4. **meson wraps** — the manifest's own pin files: `[wrap-git]` clones
    the pinned URL/revision, `[wrap-file]` downloads + extracts the
-   pinned tarball (+ optional patch). Wraps no `dependency()` call
-   references are still honored (`meson subprojects download` policy —
-   over-provide, never under-provide).
-5. **vendored subprojects** — checked-in trees: satisfied in-tree.
+   pinned tarball (+ optional patch, falling back to the wrap's own
+   `source_fallback_url` when the primary refuses — exactly what meson
+   does). Wraps no `dependency()` call references are still honored
+   (`meson subprojects download` policy — over-provide, never
+   under-provide). A wrap matches a declared name by its stem, its
+   `[provide]` module names (both wrap-db conventions:
+   `dependency_names = a,b` and `a = a_dep` per line), or the
+   dependency's own `fallback: ['<subproject>', …]` kwarg — meson's
+   fallback semantics name the subproject explicitly.
+5. **vendored subprojects and in-tree provides** — checked-in trees:
+   satisfied in-tree; modules the scanned tree's own build declares via
+   `meson.override_dependency` (GLib provides `girepository-2.0`):
+   satisfied by building that same tree, nothing fetched.
 6. **shared library cache** — `<root>/libs/` entries matched by the
    names the built library actually *provides* (`.pc` module stems,
    `*Config.cmake` packages, `lib*.a/.so` members).

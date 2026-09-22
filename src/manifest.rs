@@ -96,13 +96,18 @@ pub fn detect_build_system(src: &Path) -> Result<BuildSystem> {
         Ok(BuildSystem::Cargo)
     } else if has("configure") {
         Ok(BuildSystem::Autotools)
+    } else if has("configure.ac") || has("configure.in") {
+        // a git checkout of an autotools project ships the input, not
+        // the generated script (release tarballs carry `configure`);
+        // the build chain bootstraps it with autoreconf
+        Ok(BuildSystem::Autotools)
     } else if has("Makefile") {
         Ok(BuildSystem::Make)
     } else {
         Err(GitfullError::Unsupported(format!(
             "no recognized build system in {} (looked for meson.build, \
-             CMakeLists.txt, Cargo.toml, configure, Makefile). Auto-detection \
-             needs no extra files; you can force one with \
+             CMakeLists.txt, Cargo.toml, configure, configure.ac, Makefile). \
+             Auto-detection needs no extra files; you can force one with \
              [repo.\"owner/name\"] build_system = \"...\" in gitfull.conf",
             src.display()
         )))

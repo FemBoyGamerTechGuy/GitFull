@@ -35,7 +35,7 @@
 //! → their correct upstream repos) → ranked forge search as a FLAGGED
 //! fallback whose unconfirmed matches are never auto-built.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,8 +90,13 @@ pub struct DeclaredDep {
     pub name_norm: String,
     pub kind: DepKind,
     /// `true` unless the declaration marks it optional
-    /// (`required: false`, `find_package(... OPTIONAL)`, ...).
+    /// (`required: false`, a feature option resolving to `'auto'`,
+    /// `find_package(... OPTIONAL)`, ...).
     pub required: bool,
+    /// Why the declaration is optional, per the manifest's own semantics
+    /// (`required: false`, the feature option's resolved state, ...) —
+    /// shown in reports so the classification is auditable.
+    pub optional_why: Option<String>,
     /// Version constraint as written (e.g. `>=1.2`), report-only: the
     /// build system's own dependency check stays the version authority.
     pub version: Option<String>,
@@ -99,6 +104,12 @@ pub struct DeclaredDep {
     pub origin: String,
     /// For `CrateGit` deps: the git URL from the manifest.
     pub git_url: Option<String>,
+    /// meson `fallback: ['subproject', 'var']` — the subproject (wrap)
+    /// that satisfies this dependency when the system lookup fails.
+    /// meson's own fallback semantics: a wrap with this stem is THE
+    /// source for the name (e.g. `dependency('xmlb', fallback:
+    /// ['libxmlb', …])` resolves through subprojects/libxmlb.wrap).
+    pub fallback_subproject: Option<String>,
 }
 
 /// A parsed meson subproject wrap file.
@@ -108,10 +119,11 @@ pub struct WrapDep {
     pub name: String,
     /// `[wrap-git]`: repository url + revision.
     pub git: Option<(String, String)>,
-    /// `[wrap-file]`: source url (+ optional patch url).
-    pub file: Option<(String, Option<String>)>,
-    /// `[provide] dependency_names = a,b` — pkg-config names this wrap
-    /// provides (newer wrap-db convention). Falls back to the stem.
+    /// `[wrap-file]`: source url, the wrapdb `source_fallback_url`,
+    /// and an optional patch url.
+    pub file: Option<(String, Option<String>, Option<String>)>,
+    /// `[provide]` provided pkg-config names — both wrap-db conventions
+    /// (`dependency_names = a,b` and `a = a_dep` per line).
     pub provides: Vec<String>,
     pub origin: String,
 }
@@ -121,13 +133,21 @@ pub struct WrapDep {
 pub struct DeclaredDeps {
     /// Dependencies gitfull must provision (or prove satisfied).
     pub required: Vec<DeclaredDep>,
-    /// Declared but optional per the manifest — reported, not provisioned.
+    /// Declared but optional per the manifest (`required: false`, a
+    /// feature option in `'auto'`, ...) — resolved silently when a sound
+    /// source exists (pin / wrap / cache / curated map), never blocking.
     pub optional: Vec<DeclaredDep>,
     /// meson subproject wraps (an independent, self-describing source).
     pub wraps: Vec<WrapDep>,
     /// meson vendored subprojects (`subprojects/<name>/` checked-in
     /// trees, no wrap): resolved in-tree, never fetched.
     pub vendored: Vec<String>,
+    /// Modules this very tree's own build provides — meson's
+    /// `meson.override_dependency('name', <dep>)` declarations (e.g.
+    /// GLib's tree provides `girepository-2.0`). A `dependency()` call
+    /// for such a name is satisfied by building THIS tree, not by
+    /// fetching anything.
+    pub provided_in_tree: Vec<String>,
 }
 
 impl DeclaredDeps {
@@ -161,10 +181,22 @@ impl DeclaredDeps {
 
 /// meson built-in `dependency()` names that never denote an external
 /// library to fetch (they resolve against the toolchain itself).
-pub const MESON_BUILTINS: &[&str] = &["threads", "python3", "gtest", "gmock", "disabler"];
+/// `iconv` is included because every libc gitfull builds against
+/// (glibc, musl, darwin, the BSDs) provides it in the C library — the
+/// same resolution category as `threads`, not a fetchable module.
+pub const MESON_BUILTINS: &[&str] = &[
+    "threads",
+    "python3",
+    "gtest",
+    "gmock",
+    "disabler",
+    "iconv",
+];
 
 /// cmake built-in `find_package()` modules that are satisfied by the
-/// toolchain (threads / language runtimes), not external libraries.
+/// toolchain (threads / language runtimes), not external libraries —
+/// plus the classic PROGRAM-lookup modules (FindGit, FindDoxygen, …):
+/// they resolve against tools on PATH, the same category as `threads`.
 pub const CMAKE_BUILTINS: &[&str] = &[
     "threads",
     "python3",
@@ -172,14 +204,23 @@ pub const CMAKE_BUILTINS: &[&str] = &[
     "python",
     "cmake",
     "pkgconfig",
+    "git",
+    "doxygen",
+    "perl",
+    "flex",
+    "bison",
+    "swig",
 ];
 
 /// `AC_CHECK_LIB` / `AC_SEARCH_LIBS` targets that live in libc / the
 /// compiler runtime delivered by the toolchain's gcc (the classic
-/// libc helper libraries).
+/// libc helper libraries — including the socket-service fallbacks like
+/// `inet` that modern libc provides in `libc` itself, so
+/// `AC_SEARCH_LIBS(connect, inet)` finds it without any external
+/// library).
 pub const LIBC_LIBS: &[&str] = &[
     "c", "m", "dl", "pthread", "rt", "intl", "gcc", "gcc_s", "supc++", "socket", "nsl", "resolv",
-    "crypt",
+    "crypt", "inet",
 ];
 
 fn normalize_name(s: &str) -> String {
@@ -209,6 +250,8 @@ pub fn scan(src: &Path, bs: BuildSystem) -> Result<DeclaredDeps> {
     // a name declared both required (anywhere) and optional is required
     out.optional
         .retain(|o| !out.required.iter().any(|r| r.name_norm == o.name_norm));
+    out.provided_in_tree.sort();
+    out.provided_in_tree.dedup();
     Ok(out)
 }
 
@@ -289,35 +332,52 @@ fn scan_meson_for(src: &Path, system: &str) -> Result<DeclaredDeps> {
     // evaluated with ONE shared variable scope in meson's execution
     // order (subdir() runs in the caller's scope — that is how GLib
     // gates `dependency('appleframeworks')` in subdir files on a
-    // variable the root computes as darwin-only). subprojects/ trees
-    // are managed via wraps — their own manifests are not the
-    // project's declarations.
+    // variable the root computes as darwin-only). foreach loops over
+    // literal lists are unrolled per item, so a backend dispatched as
+    // `subdir(backend)` behind `get_variable('@0@_enabled'.format(
+    // backend))` drops out when its enabled flag is provably false.
+    // subprojects/ trees are managed via wraps — their own manifests
+    // are not the project's declarations.
     let root = src.join("meson.build");
-    let analyzed = if root.is_file() {
-        crate::mesoneval::eval_project(&root, system)
-    } else {
-        Vec::new()
+    let mut options = crate::mesoneval::load_project_options(src);
+    if let Ok(text) = fs::read_to_string(&root) {
+        crate::mesoneval::overlay_default_options(&text, &mut options);
+    }
+    let mctx = MesonScanCtx {
+        system,
+        options: &options,
     };
-    let seen: BTreeSet<PathBuf> = analyzed.iter().map(|f| f.path.clone()).collect();
-    for fe in &analyzed {
+
+    let analyzed = if root.is_file() {
+        crate::mesoneval::eval_project_with_options(&root, system, options.clone())
+    } else {
+        crate::mesoneval::ProjectEval::default()
+    };
+    let seen: BTreeSet<PathBuf> = analyzed.files.iter().map(|f| f.path.clone()).collect();
+    for fe in &analyzed.files {
         let origin_base = relativize(&fe.path, src);
-        parse_meson_dependency_calls(fe, &origin_base, &mut deps);
+        parse_meson_dependency_calls(fe, &origin_base, &mut deps, &mctx);
     }
 
     // fallback: meson.build files NOT reachable through static
     // subdir() calls (dynamic `subdir(var)` paths, foreach-driven
-    // subdirs) — evaluated with an isolated scope so their
-    // unconditional declarations are still reported, and their own
-    // conditionals are still honored
+    // subdirs) — evaluated with an isolated scope (plus the project's
+    // option table) so their unconditional declarations are still
+    // reported, and their own conditionals are still honored. Anything
+    // under a PROVABLY never-entered directory (a subdir() in a
+    // provably-dead branch, a dead foreach-dispatch item) is excluded:
+    // meson never executes it, so its declarations are not part of any
+    // build here.
+    let mut excluded = analyzed.excluded;
     let mut builds: Vec<PathBuf> = Vec::new();
     walk_files(src, &mut builds, &|n| n == "meson.build", &["subprojects"]);
     for f in builds {
-        if seen.contains(&f) {
+        if seen.contains(&f) || excluded.iter().any(|d| f.starts_with(d)) {
             continue;
         }
-        let fe = crate::mesoneval::eval_isolated(&f, system);
+        let fe = crate::mesoneval::eval_isolated_with_options(&f, system, &options, &mut excluded);
         let origin_base = relativize(&f, src);
-        parse_meson_dependency_calls(&fe, &origin_base, &mut deps);
+        parse_meson_dependency_calls(&fe, &origin_base, &mut deps, &mctx);
     }
     Ok(deps)
 }
@@ -327,72 +387,223 @@ fn relativize(p: &Path, src: &Path) -> String {
     p.strip_prefix(src).unwrap_or(p).display().to_string()
 }
 
+/// Shared context for one meson scan: the target platform and the
+/// project's option table.
+struct MesonScanCtx<'a> {
+    system: &'a str,
+    options: &'a crate::mesoneval::OptTable,
+}
+
 /// Extract `dependency('name', ...)` calls (including multi-line ones)
-/// with their salient kwargs — but only from statements **reachable for
-/// the platform the tree was evaluated for**
-/// ([`FileEval::statement_active_at`]): a call inside a provably-dead
-/// branch (`if host_machine.system() == 'darwin'` when scanning for
-/// Linux) is not a dependency of this build at all. Also records
-/// `subproject('x')`-style references implicitly: a name provided by a
-/// wrap is fetched via the wrap (see [`DeclaredDeps::wrap_provided`]).
+/// with their salient kwargs — but only real ones:
+///
+/// * only from statements **reachable for the platform the tree was
+///   evaluated for** ([`FileEval::statement_active_at`]): a call inside
+///   a provably-dead branch (`if host_machine.system() == 'darwin'`
+///   when scanning for Linux, `if get_option('docs')` for a
+///   default-off option) is not a dependency of this build at all;
+/// * never from string literals or `#` comments (string content is
+///   not a call);
+/// * never from **method-call forms** — `meson.override_dependency(
+///   'x', dep)` (this tree PROVIDES module x — the mirror image of a
+///   dependency declaration), `subproject.dependency(...)`, … only
+///   the standalone global `dependency()` function declares one.
+///
+/// Each call's `required:` kwarg is evaluated structurally against the
+/// project's option table and the variable scope at the call site (see
+/// [`crate::mesoneval::requiredness_of`]) — never against names.
 fn parse_meson_dependency_calls(
     fe: &crate::mesoneval::FileEval,
     origin_base: &str,
     deps: &mut DeclaredDeps,
+    mctx: &MesonScanCtx<'_>,
 ) {
     let text = &fe.text;
     let bytes = text.as_bytes();
+    let strs = string_ranges(text);
     let mut i = 0usize;
     while let Some(rel) = find_sub(bytes, i, b"dependency(") {
-        // avoid matching `meson.get_compiler(...).dependency(` twice is
-        // fine — same call; but avoid `subproject.dependency(`? meson
-        // vars can shadow; over-approximation is safe (dedup by name).
-        let start = rel + b"dependency(".len();
-        // scan the argument list for a balanced ')'
-        let mut depth = 1usize;
-        let mut j = start;
-        let mut in_str: Option<u8> = None;
-        while j < bytes.len() && depth > 0 {
-            let c = bytes[j];
-            if let Some(q) = in_str {
-                if c == b'\\' {
-                    j += 2;
-                    continue;
-                }
-                if c == q {
-                    in_str = None;
-                }
-            } else if c == b'\'' || c == b'"' {
-                in_str = Some(c);
-            } else if c == b'(' {
-                depth += 1;
-            } else if c == b')' {
-                depth -= 1;
-            }
-            j += 1;
+        let next = rel + 1;
+        // string/comment content: never a call
+        if strs.iter().any(|&(a, b)| rel >= a && rel <= b) {
+            i = next;
+            continue;
         }
-        let call = &text[start..j.saturating_sub(1).max(start)];
+        // token-boundary check: a real global `dependency(` declaration
+        // NEVER has identifier characters — or a method-call dot —
+        // abutting the match. When either is present the match is part
+        // of a longer token: a method call (`meson.override_dependency(
+        // 'x', dep)`, `sub.dependency(...)`) or a different function
+        // whose name merely contains "dependency"
+        // (`declare_dependency(...)`) — neither declares a dependency of
+        // this build.
+        let mut k = rel;
+        while k > 0
+            && (bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_')
+        {
+            k -= 1;
+        }
+        let is_dot_method = k > 0 && bytes[k - 1] == b'.';
+        if k < rel || is_dot_method {
+            // the method name extends THROUGH the matched "dependency"
+            // ("override_" + "dependency" = "override_dependency")
+            if is_dot_method {
+                let method = format!("{}dependency", &text[k..rel]);
+                if method == "override_dependency" {
+                    // meson.override_dependency('mod', dep): THIS tree's
+                    // own build provides the module — a
+                    // provides-declaration, not a requirement
+                    let start = rel + b"dependency(".len();
+                    if let Some(close) = call_close_paren(bytes, start) {
+                        if fe.statement_active_at(rel) {
+                            let call = &text[start..close];
+                            if let Some(name) = first_string_arg(call) {
+                                let norm = normalize_name(&name);
+                                if !norm.is_empty() {
+                                    deps.provided_in_tree.push(norm);
+                                }
+                            }
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+            // any other longer token or method call: not a global
+            // declaration
+            i = next;
+            continue;
+        }
+        // the standalone global dependency() declaration
+        let start = rel + b"dependency(".len();
+        let Some(close) = call_close_paren(bytes, start) else {
+            i = next;
+            continue;
+        };
+        let call = &text[start..close];
         // conditional context: only a statement that can execute on
         // the scanned platform declares a dependency of this build
         if fe.statement_active_at(rel) {
             let line = 1 + text[..rel].matches('\n').count();
-            record_meson_call(call, &format!("{origin_base}:{line}"), deps);
+            let vars = fe.dep_scope_at(rel);
+            record_meson_call(
+                call,
+                &format!("{origin_base}:{line}"),
+                deps,
+                mctx,
+                vars,
+            );
         }
-        i = j.max(rel + 1);
+        i = close + 1;
     }
 }
 
-fn record_meson_call(call: &str, origin: &str, deps: &mut DeclaredDeps) {
-    // first argument: a string literal (the dependency name)
+/// The value of the first argument when it is a string literal (the
+/// dependency-name shape; dynamic names are not statically knowable).
+fn first_string_arg(call: &str) -> Option<String> {
     let trimmed = call.trim_start();
-    let name = if trimmed.starts_with('\'') || trimmed.starts_with('"') {
+    if trimmed.starts_with('\'') || trimmed.starts_with('"') {
         let q = trimmed.as_bytes()[0];
-        trimmed[1..]
+        return trimmed[1..]
             .split(q as char)
             .next()
-            .unwrap_or("")
-            .to_string()
-    } else {
+            .map(|s| s.to_string());
+    }
+    None
+}
+
+/// Byte ranges (inclusive of delimiters) of every NON-CODE region —
+/// string literals (`'…'`, `"…"`, `'''…'''`, `"""…"""`) and `#`
+/// comments — where a `dependency(` match is text, not a call.
+fn string_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'#' {
+            // comment runs to end of line — record its extent
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push((start, i.saturating_sub(1)));
+            i += 1;
+            continue;
+        }
+        if c != b'\'' && c != b'"' {
+            i += 1;
+            continue;
+        }
+        let triple = bytes[i..].starts_with(&[c, c, c][..]);
+        let mut j = i + if triple { 3 } else { 1 };
+        let mut closed = false;
+        while j < bytes.len() {
+            if bytes[j] == b'\\' && !triple {
+                j += 2;
+                continue;
+            }
+            if triple {
+                if bytes[j..].starts_with(&[c, c, c][..]) {
+                    j += 3;
+                    closed = true;
+                    break;
+                }
+            } else if bytes[j] == c {
+                j += 1;
+                closed = true;
+                break;
+            }
+            j += 1;
+        }
+        let end = if closed { j - 1 } else { bytes.len().saturating_sub(1) };
+        out.push((i, end));
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// Index of the `)` matching the opening paren just before `start`
+/// (`start` points at the first argument byte), skipping string
+/// literals — `None` when unbalanced.
+fn call_close_paren(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut j = start;
+    let mut in_str: Option<u8> = None;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                j += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else if c == b'\'' || c == b'"' {
+            in_str = Some(c);
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+fn record_meson_call(
+    call: &str,
+    origin: &str,
+    deps: &mut DeclaredDeps,
+    mctx: &MesonScanCtx<'_>,
+    vars: Option<&HashMap<String, crate::mesoneval::Val>>,
+) {
+    // first argument: a string literal (the dependency name)
+    let Some(name) = first_string_arg(call) else {
         return; // dynamic name (variable/computed): not statically knowable
     };
     if name.is_empty() || MESON_BUILTINS.contains(&name.as_str()) {
@@ -400,25 +611,35 @@ fn record_meson_call(call: &str, origin: &str, deps: &mut DeclaredDeps) {
         // the toolchain itself: skip entirely
         return;
     }
-    // kwargs of interest: required: false / version: '...'
-    let lower = call.to_ascii_lowercase();
-    let required = !lower.contains("required")
-        || lower.contains("required: true")
-        || lower.contains("required : true");
     let version = extract_kwarg_string(call, "version");
+    // meson's own fallback semantics: the first element of
+    // `fallback: ['subproject', 'var']` names the wrap that satisfies
+    // this dependency when the system lookup fails
+    let fallback_subproject = crate::mesoneval::kwarg_first_string(call, "fallback");
+    // meson's own required/optional semantics for this call, read
+    // structurally: `required: false`, `required: true`, `required:
+    // get_option('x')` against the option's declared default, feature
+    // coercions, variables at the call site. No `required:` (the
+    // default) or an undecidable value stays REQUIRED.
+    let (req, why) =
+        crate::mesoneval::requiredness_of(call, vars, mctx.options, mctx.system);
     let d = DeclaredDep {
         name: name.clone(),
         name_norm: normalize_name(&name),
         kind: DepKind::PkgConfig,
-        required,
+        required: req == crate::mesoneval::Requiredness::Required,
+        optional_why: (!why.is_empty()).then_some(why),
         version,
         origin: origin.to_string(),
         git_url: None,
+        fallback_subproject,
     };
-    if required {
-        deps.required.push(d);
-    } else {
-        deps.optional.push(d);
+    match req {
+        crate::mesoneval::Requiredness::Required => deps.required.push(d),
+        crate::mesoneval::Requiredness::Optional => deps.optional.push(d),
+        // a feature option resolving to 'disabled': meson skips the
+        // lookup entirely — not a dependency of this configuration
+        crate::mesoneval::Requiredness::Disabled => {}
     }
 }
 
@@ -455,7 +676,7 @@ pub fn parse_wrap(path: &Path) -> Result<Option<WrapDep>> {
         .unwrap_or_default();
     let mut section = String::new();
     let mut git: Option<(String, String)> = None;
-    let mut file: Option<(String, Option<String>)> = None;
+    let mut file: Option<(String, Option<String>, Option<String>)> = None;
     let mut provides: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
@@ -480,13 +701,26 @@ pub fn parse_wrap(path: &Path) -> Result<Option<WrapDep>> {
                 }
             }
             ("wrap-file", "source_url") => {
-                file = Some((v.to_string(), None));
+                file = Some((v.to_string(), None, None));
             }
-            ("wrap-file", "patch_url") => {
+            ("wrap-file", "source_fallback_url") => {
                 if let Some(f) = file.as_mut() {
                     f.1 = Some(v.to_string());
                 }
             }
+            ("wrap-file", "patch_url") => {
+                if let Some(f) = file.as_mut() {
+                    f.2 = Some(v.to_string());
+                }
+            }
+            // [provide] — BOTH wrap-db conventions:
+            //   dependency_names = foo, bar       (legacy comma list)
+            //   foo = foo_dep                    (modern per-line: the KEY
+            //                                     is a provided module name,
+            //                                     the value the variable it
+            //                                     is exposed as — e.g.
+            //                                     `libpcre2-8 = libpcre2_8`,
+            //                                     `intl = intl_dep`)
             ("provide", "dependency_names") => {
                 provides = v
                     .split(',')
@@ -494,6 +728,10 @@ pub fn parse_wrap(path: &Path) -> Result<Option<WrapDep>> {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
+            }
+            ("provide", "program_names") => {} // find_program provides, not deps
+            ("provide", other) => {
+                provides.push(other.to_string());
             }
             _ => {}
         }
@@ -565,9 +803,12 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
                 name_norm: norm,
                 kind,
                 required,
+                optional_why: (!required)
+                    .then(|| "cmake find_package without REQUIRED".to_string()),
                 version,
                 origin: format!("{origin_base}:{line}"),
                 git_url: None,
+                fallback_subproject: None,
             };
             if required {
                 deps.required.push(d);
@@ -894,6 +1135,7 @@ fn scan_cargo_toml(
                         DepKind::CrateRegistry
                     },
                     required: !is_dev,
+                    optional_why: is_dev.then(|| "dev-dependency (tests/examples only)".to_string()),
                     version: spec.as_str().map(|s| s.to_string()).or_else(|| {
                         spec.get("version")
                             .and_then(|v| v.as_str())
@@ -901,6 +1143,7 @@ fn scan_cargo_toml(
                     }),
                     origin: origin.clone(),
                     git_url,
+                    fallback_subproject: None,
                 };
                 if is_dev {
                     // dev-dependencies only build tests/examples: reported,
@@ -986,9 +1229,12 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                     name_norm: norm,
                     kind: DepKind::PkgConfig,
                     required,
+                    optional_why: (!required)
+                        .then(|| "PKG_CHECK_MODULES with a not-found handler".to_string()),
                     version: ver.or(ver2.map(|s| s.to_string())),
                     origin: format!("{origin}:{line}"),
                     git_url: None,
+                    fallback_subproject: None,
                 };
                 if required {
                     deps.required.push(d);
@@ -1009,6 +1255,19 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                 let line = 1 + clean[..abs].matches('\n').count();
                 // AC_CHECK_LIB(lib, ...) → arg 0; AC_SEARCH_LIBS(func, libs) → arg 1
                 let which = if macro_name == "ac_check_lib" { 0 } else { 1 };
+                // AC_CHECK_LIB(lib, func, if-found, if-not-found): a
+                // non-empty 4th argument handles absence instead of
+                // aborting configure — the same optional form
+                // PKG_CHECK_MODULES has (GTK2's `AC_CHECK_LIB(mlib, …,
+                // use_mlib=yes, use_mlib=no)` probes mediaLib best-effort)
+                let required = if macro_name == "ac_check_lib" {
+                    args.len() < 4 || args[3].trim().is_empty()
+                } else {
+                    // AC_SEARCH_LIBS(func, libs): absence merely leaves
+                    // LIBS untouched (non-fatal), but it has no explicit
+                    // handler argument — conservative: required
+                    true
+                };
                 let libs: Vec<&str> = args
                     .iter()
                     .nth(which)
@@ -1026,15 +1285,23 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                     {
                         continue;
                     }
-                    deps.required.push(DeclaredDep {
+                    let d = DeclaredDep {
                         name: l.to_string(),
                         name_norm: norm,
                         kind: DepKind::AutoconfLib,
-                        required: true,
+                        required,
+                        optional_why: (!required)
+                            .then(|| "AC_CHECK_LIB with a not-found handler".to_string()),
                         version: None,
                         origin: format!("{origin}:{line}"),
                         git_url: None,
-                    });
+                        fallback_subproject: None,
+                    };
+                    if required {
+                        deps.required.push(d);
+                    } else {
+                        deps.optional.push(d);
+                    }
                 }
             }
             idx = abs + macro_name.len();
@@ -1045,7 +1312,9 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
 
 /// Split an m4 macro invocation into its bracketed arguments
 /// (`NAME([a], [b]) → ["a", "b"]`). `pos` points at the macro name; the
-/// name (and optional whitespace) is skipped before the `(`.
+/// name (and optional whitespace) is skipped before the `(`. m4 `dnl`
+/// comments (discard-to-newline — common inside multi-line module
+/// lists, as in GTK2's configure.ac) are stripped from each argument.
 fn m4_args(text: &str, pos: usize) -> Option<Vec<String>> {
     let bytes = text.as_bytes();
     let mut i = pos;
@@ -1070,7 +1339,7 @@ fn m4_args(text: &str, pos: usize) -> Option<Vec<String>> {
         } else if c == ']' && brack == 1 {
             brack -= 1;
         } else if c == ',' && depth == 1 && brack == 0 {
-            args.push(cur.clone());
+            args.push(strip_dnl(&cur));
             cur.clear();
         } else if c == '(' && brack == 0 {
             depth += 1;
@@ -1084,8 +1353,40 @@ fn m4_args(text: &str, pos: usize) -> Option<Vec<String>> {
         }
         i += 1;
     }
-    args.push(cur);
+    args.push(strip_dnl(&cur));
     Some(args)
+}
+
+/// Strip m4 `dnl` comments (discard to end of line) from a macro
+/// argument. `dnl` must be a standalone token (whitespace/bracket
+/// delimited) — `libdnlfoo` is a name, not a comment. Multi-line
+/// arguments collapse to single-line text with the comments gone.
+fn strip_dnl(s: &str) -> String {
+    let mut out = String::new();
+    for l in s.lines() {
+        let b = l.as_bytes();
+        let mut cut = b.len();
+        let mut i = 0usize;
+        while i + 3 <= b.len() {
+            if &b[i..i + 3] == b"dnl" {
+                let before_ok = i == 0
+                    || b[i - 1].is_ascii_whitespace()
+                    || b[i - 1] == b'[';
+                let after = i + 3;
+                let after_ok = after >= b.len()
+                    || b[after].is_ascii_whitespace()
+                    || b[after] == b']';
+                if before_ok && after_ok {
+                    cut = i;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        out.push_str(l[..cut].trim_end());
+        out.push(' ');
+    }
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,9 +1455,11 @@ fn scan_make(src: &Path) -> Result<DeclaredDeps> {
                 name_norm: norm,
                 kind: DepKind::PkgConfig,
                 required: true,
+                optional_why: None,
                 version: None,
                 origin: format!("Makefile:{}", i + 1),
                 git_url: None,
+                fallback_subproject: None,
             });
         }
     }
@@ -1271,6 +1574,192 @@ cc = meson.get_compiler('c')
     }
 
     #[test]
+    fn meson_wraps_modern_provide_convention() {
+        // the modern wrap-db [provide] form: `module = variable` per
+        // line (e.g. glib's pcre2.wrap provides libpcre2-8/16/32/posix;
+        // proxy-libintl.wrap provides intl). The KEY is the provided
+        // dependency name; the value is the subproject variable it is
+        // exposed as (irrelevant for source resolution).
+        let d = tmpdir("wraps-modern");
+        fs::write(d.join("meson.build"), "project('w')\nz = dependency('zlib')\n").unwrap();
+        fs::create_dir_all(d.join("subprojects")).unwrap();
+        fs::write(
+            d.join("subprojects/pcre2.wrap"),
+            "[wrap-file]\ndirectory = pcre2-10.46\nsource_url = https://example.com/pcre2.tar.bz2\n\n[provide]\nlibpcre2-8 = libpcre2_8\nlibpcre2-16 = libpcre2_16\nlibpcre2-32 = libpcre2_32\nlibpcre2-posix = libpcre2_posix\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("subprojects/proxy-libintl.wrap"),
+            "[wrap-file]\ndirectory = proxy-libintl-0.5\nsource_url = https://example.com/libintl.tar.gz\n\n[provide]\nintl = intl_dep\n",
+        )
+        .unwrap();
+        let deps = scan(&d, BuildSystem::Meson).unwrap();
+        let p = deps.wraps.iter().find(|w| w.name == "pcre2").unwrap();
+        assert_eq!(
+            p.provides,
+            vec![
+                "libpcre2-8".to_string(),
+                "libpcre2-16".to_string(),
+                "libpcre2-32".to_string(),
+                "libpcre2-posix".to_string(),
+            ]
+        );
+        let i = deps.wraps.iter().find(|w| w.name == "proxy-libintl").unwrap();
+        assert_eq!(i.provides, vec!["intl".to_string()]);
+        // wrap-provided names are queryable — a dependency('libpcre2-8')
+        // resolves through the wrap layer, never through search
+        assert!(deps.wrap_provided().contains("libpcre2-8"));
+        assert!(deps.wrap_provided().contains("intl"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_fallback_kwarg_names_the_wrap() {
+        // meson's fallback semantics: `dependency('xmlb', fallback:
+        // ['libxmlb', 'libxmlb_dep'])` resolves through the libxmlb
+        // wrap when the system lookup fails — the kwarg names THE
+        // subproject for this dependency name
+        let d = tmpdir("fallback-kwarg");
+        fs::write(
+            d.join("meson.build"),
+            "project('a')\nxmlb_dep = dependency('xmlb', version: '>=0.3.14', fallback: ['libxmlb', 'libxmlb_dep'], default_options: ['gtkdoc=false'])\n",
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("subprojects")).unwrap();
+        fs::write(
+            d.join("subprojects/libxmlb.wrap"),
+            "[wrap-git]\ndirectory = libxmlb\nurl = https://github.com/hughsie/libxmlb.git\nrevision = main\n",
+        )
+        .unwrap();
+        let deps = scan(&d, BuildSystem::Meson).unwrap();
+        let x = deps.required.iter().find(|x| x.name == "xmlb").unwrap();
+        assert_eq!(
+            x.fallback_subproject.as_deref(),
+            Some("libxmlb"),
+            "the fallback kwarg's first element names the subproject"
+        );
+        // version capture works alongside the fallback kwarg
+        assert_eq!(x.version.as_deref(), Some(">=0.3.14"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_iconv_is_a_libc_builtin() {
+        // iconv lives in the C library on every platform gitfull builds
+        // against (glib's non-windows branch declares it) — the same
+        // resolution category as `threads`: the toolchain provides it
+        let d = tmpdir("iconv-builtin");
+        fs::write(
+            d.join("meson.build"),
+            "project('i', 'c')\nif host_machine.system() != 'windows'\n  libiconv = dependency('iconv')\nendif\nz = dependency('zlib')\n",
+        )
+        .unwrap();
+        let deps = scan(&d, BuildSystem::Meson).unwrap();
+        assert_eq!(names(&deps.required), vec!["zlib"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_ternary_and_require_chain_kill_default_off_features() {
+        // the libxml2 shape: feature options chained through ternaries
+        // and .require() — with 'history'/'readline' defaulting to
+        // 'auto', BOTH want flags resolve false and the shell-history
+        // deps drop out of a default build
+        let d = tmpdir("ternary-require");
+        fs::write(
+            d.join("meson.options"),
+            "option('history', type: 'feature', description: 'x')\noption('readline', type: 'feature', description: 'x')\noption('legacy', type: 'feature', value: 'disabled', description: 'x')\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('xml-like', 'c')
+feature = get_option('readline')
+want_readline = get_option('history').enabled() ? feature.allowed() : feature.enabled()
+feature = get_option('history') \
+  .require(want_readline, error_message: 'history requires readline')
+want_history = feature.enabled()
+
+if want_readline
+    readline_dep = dependency('readline')
+endif
+if want_history
+    history_dep = dependency('history')
+endif
+zlib_dep = dependency('zlib')
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // auto (not enabled) propagates through the ternary's else arm
+        // and the .require() chain: both features land disabled
+        assert_eq!(names(&deps.required), vec!["zlib"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_ternary_with_decided_condition_selects_branch() {
+        // a ternary whose condition IS statically known picks its branch
+        let d = tmpdir("ternary-pick");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('t', 'c')
+want_thing = host_machine.system() == 'linux' ? true : false
+if want_thing
+  a = dependency('libaaa')
+endif
+other = get_option('prefix') != 'x' ? 'b' : 'c'
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libaaa"]);
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(names(&deps.required), Vec::<String>::new());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn autotools_dnl_comments_and_libc_socket_fallbacks() {
+        // the GTK2 configure.ac shape: multi-line PKG_CHECK_MODULES
+        // module lists with `dnl` comments inside, and the classic
+        // AC_SEARCH_LIBS socket fallbacks that modern libc provides
+        let d = tmpdir("gtk2-ac");
+        fs::write(
+            d.join("configure.ac"),
+            r#"AC_INIT([gtk-like], [2.24.33])
+PKG_CHECK_MODULES(BASE_DEPENDENCIES,
+  [glib-2.0 >= glib_required_version dnl
+   atk >= atk_required_version dnl
+   pango >= pango_required_version])
+AC_SEARCH_LIBS(gethostent, nsl)
+AC_SEARCH_LIBS(setsockopt, socket)
+AC_SEARCH_LIBS(connect, inet)
+AC_CHECK_LIB(w, iswalnum, GDK_WLIBS=-lw)
+AC_CHECK_LIB(mlib, mlib_ImageSetStruct, use_mlib=yes, use_mlib=no)
+AC_CHECK_LIB(papi, papiServiceCreate, have_papi=yes, have_papi=no)
+"#,
+        )
+        .unwrap();
+        let deps = scan(&d, BuildSystem::Autotools).unwrap();
+        assert_eq!(
+            names(&deps.required),
+            vec!["atk", "glib-2.0", "pango", "w"],
+            "dnl comments must vanish; nsl/socket/inet are libc; the 'w' \
+             wide-char fallback lib stays declared (3-arg probe, no handler)"
+        );
+        // the 4-arg AC_CHECK_LIB form carries a not-found handler
+        // (use_mlib=no / have_papi=no): best-effort probes, optional
+        assert_eq!(names(&deps.optional), vec!["mlib", "papi"]);
+        let mlib = deps.optional.first().unwrap();
+        assert_eq!(
+            mlib.optional_why.as_deref(),
+            Some("AC_CHECK_LIB with a not-found handler")
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn meson_wraps_and_vendored_subprojects() {
         let d = tmpdir("wraps");
         fs::write(
@@ -1325,9 +1814,14 @@ patch_url = https://example.com/somelib-2.3-patch.tar.gz
         assert_eq!(z.provides, vec!["zlib".to_string(), "zlib-ng".to_string()]);
         let s = deps.wraps.iter().find(|w| w.name == "somelib").unwrap();
         assert_eq!(
-            s.file.as_ref().map(|(u, p)| (u.as_str(), p.clone())),
+            s.file.as_ref().map(|(u, fb, p)| (
+                u.as_str(),
+                fb.clone(),
+                p.clone(),
+            )),
             Some((
                 "https://example.com/somelib-2.3.tar.gz",
+                None,
                 Some("https://example.com/somelib-2.3-patch.tar.gz".to_string())
             ))
         );
@@ -1694,6 +2188,599 @@ base = dependency('zlib')
         let deps = scan_meson_for(&d, "linux").unwrap();
         assert_eq!(names(&deps.required), vec!["json-c", "zlib"]);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // ---- meson: required/optional semantics of dependency() calls ----------
+    //
+    // meson's own `required:` keyword (and the option gates around the
+    // call) decide whether a dependency blocks a default build. Every
+    // fixture here is scanned on linux with the project's DECLARED
+    // option defaults — the configuration gitfull provisions.
+
+    #[test]
+    fn meson_required_kwarg_literal_shapes() {
+        // every literal spelling meson uses, including the spaced
+        // `required : false` form and multi-line calls with comments
+        let d = tmpdir("meson-req-literals");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('literals', 'c')
+a = dependency('libaaa')                                  # no kwarg: required
+b = dependency('libbbb', required: false)
+c = dependency('libccc', required : false)                # spaced form
+d = dependency('libddd', required: true)
+e = dependency('libeee',
+   required: false)                                       # multi-line
+f = dependency('libfff',   # a comment inside the call
+   required: false)        # ...and after it
+g = dependency('libggg', version: '>=1.0', required: false)
+h = dependency('libhhh', required: false, version: '>=2.0')
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libaaa", "libddd"]);
+        assert_eq!(
+            names(&deps.optional),
+            vec!["libbbb", "libccc", "libeee", "libfff", "libggg", "libhhh"]
+        );
+        // the optional classification carries its manifest reason
+        let b = deps.optional.iter().find(|x| x.name == "libbbb").unwrap();
+        assert_eq!(b.optional_why.as_deref(), Some("required: false"));
+        // version capture is unaffected by the required: kwarg
+        let g = deps.optional.iter().find(|x| x.name == "libggg").unwrap();
+        assert_eq!(g.version.as_deref(), Some(">=1.0"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_required_get_option_resolves_against_declared_defaults() {
+        // `required: get_option('x')` resolves against the option's own
+        // declared default: booleans true/false, features
+        // enabled/auto/disabled, plus the .disable_auto()/.enable_auto()
+        // coercions — each a different verdict
+        let d = tmpdir("meson-req-options");
+        fs::write(
+            d.join("meson.options"),
+            r#"option('f-enabled', type: 'feature', value: 'enabled', description: 'x')
+option('f-auto', type: 'feature', value: 'auto', description: 'x')
+option('f-disabled', type: 'feature', value: 'disabled', description: 'x')
+option('b-on', type: 'boolean', value: true, description: 'x')
+option('b-off', type: 'boolean', value: false, description: 'x')
+"#,
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('opts', 'c')
+a = dependency('libaaa', required: get_option('f-enabled'))
+b = dependency('libbbb', required: get_option('f-auto'))
+c = dependency('libccc', required: get_option('f-disabled'))
+dd = dependency('libddd', required: get_option('f-auto').disable_auto())
+e = dependency('libeee', required: get_option('f-auto').enable_auto())
+f = dependency('libfff', required: get_option('b-on'))
+g = dependency('libggg', required: get_option('b-off'))
+h = dependency('libhhh')                                # no kwarg: required
+i = dependency('libiii', required: get_option('undeclared-option'))
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // required: feature 'enabled', auto coerced to 'enabled',
+        // boolean true, no kwarg, and an UNDECLARED option (undecidable
+        // stays required — the one-sided rule)
+        assert_eq!(
+            names(&deps.required),
+            vec!["libaaa", "libeee", "libfff", "libhhh", "libiii"]
+        );
+        // optional: feature 'auto' (best-effort) and boolean false
+        assert_eq!(names(&deps.optional), vec!["libbbb", "libggg"]);
+        // dropped entirely: feature 'disabled' (meson skips the lookup)
+        // and auto coerced to 'disabled'
+        for gone in ["libccc", "libddd"] {
+            assert!(
+                !deps
+                    .required
+                    .iter()
+                    .chain(deps.optional.iter())
+                    .any(|x| x.name_norm == gone),
+                "{gone} must not appear: its lookup is skipped entirely"
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_default_off_option_gates_kill_the_branch() {
+        // the AppStream/GTK shape: `if get_option('x')` around the call.
+        // A default-false boolean makes the branch provably dead — the
+        // dependency is not part of a default build AT ALL (same
+        // treatment as a platform-gated call in a dead branch); a
+        // default-true option keeps it, and `not get_option('x')`
+        // selects the other arm.
+        let d = tmpdir("meson-opt-gates");
+        fs::write(
+            d.join("meson.options"),
+            r#"option('docs', type: 'boolean', value: false, description: 'x')
+option('install-tools', type: 'boolean', value: true, description: 'x')
+"#,
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('gated', 'c')
+if get_option('docs')
+  gtkdoc = dependency('gtk-doc')
+endif
+if get_option('install-tools')
+  tools = dependency('libtools')
+endif
+if not get_option('docs')
+  alt = dependency('libalt')
+endif
+if get_option('undeclared')
+  unknown = dependency('libunknown')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libalt", "libtools", "libunknown"]);
+        // gtk-doc sits behind a default-off option: gone, not optional
+        assert!(
+            !deps
+                .required
+                .iter()
+                .chain(deps.optional.iter())
+                .any(|x| x.name_norm == "gtk-doc"),
+            "default-off option gate must exclude the dependency entirely"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_feature_option_predicates_gate_branches() {
+        // feature options carry their own predicates; against the
+        // declared defaults each is statically decidable
+        let d = tmpdir("meson-feature-gates");
+        fs::write(
+            d.join("meson.options"),
+            r#"option('f-enabled', type: 'feature', value: 'enabled', description: 'x')
+option('f-auto', type: 'feature', value: 'auto', description: 'x')
+option('f-disabled', type: 'feature', value: 'disabled', description: 'x')
+"#,
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('featgates', 'c')
+if get_option('f-auto').allowed()
+  a = dependency('libaaa')
+endif
+if get_option('f-disabled').enabled()
+  b = dependency('libbbb')
+endif
+if get_option('f-enabled').disabled()
+  c = dependency('libccc')
+endif
+if not get_option('f-disabled').allowed()
+  d = dependency('libddd')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // allowed() on auto: true. enabled() on disabled: false (dead).
+        // disabled() on enabled: false (dead). not allowed() on
+        // disabled: true (live).
+        assert_eq!(names(&deps.required), vec!["libaaa", "libddd"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_required_kwarg_via_variable_at_call_site() {
+        // the libsoup/harfbuzz shape: the feature value is stored in a
+        // variable lines above the call (`gssapi_opt = get_option(...)`
+        // -> `required: gssapi_opt`); a plain boolean variable works the
+        // same way through the live-scope snapshot
+        let d = tmpdir("meson-req-var");
+        fs::write(
+            d.join("meson.options"),
+            r#"option('gssapi', type: 'feature', value: 'auto', description: 'x')
+"#,
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('vars', 'c')
+gssapi_opt = get_option('gssapi')
+if not gssapi_opt.disabled()
+  gssapi = dependency('libgssapi', required: gssapi_opt)
+endif
+force_off = false
+x = dependency('libforceoff', required: force_off)
+force_on = true
+y = dependency('libforceon', required: force_on)
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // auto feature via variable: optional (best-effort); the branch
+        // itself stays live (not .disabled() is true for auto)
+        assert_eq!(names(&deps.optional), vec!["libforceoff", "libgssapi"]);
+        assert_eq!(names(&deps.required), vec!["libforceon"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_project_default_options_override_declared_defaults() {
+        // project(default_options: ['k=v']) sets the defaults meson
+        // applies for THIS project, overriding the option definition's
+        // own value
+        let d = tmpdir("meson-default-options");
+        fs::write(
+            d.join("meson.options"),
+            r#"option('flag', type: 'boolean', value: false, description: 'x')
+option('feat', type: 'feature', value: 'auto', description: 'x')
+"#,
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            r#"project('overridden', 'c',
+  default_options: ['flag=true', 'feat=disabled'])
+a = dependency('libaaa', required: get_option('flag'))
+b = dependency('libbbb', required: get_option('feat'))
+if get_option('flag')
+  c = dependency('libccc')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // flag flipped true -> required + branch live; feat forced
+        // disabled -> lookup skipped entirely
+        assert_eq!(names(&deps.required), vec!["libaaa", "libccc"]);
+        assert!(
+            !deps
+                .required
+                .iter()
+                .chain(deps.optional.iter())
+                .any(|x| x.name_norm == "libbbb")
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_legacy_options_filename_is_honored() {
+        // meson_options.txt is the legacy filename still in wide use
+        // (harfbuzz, appstream, ...)
+        let d = tmpdir("meson-legacy-options");
+        fs::write(
+            d.join("meson_options.txt"),
+            "option('legacy', type: 'boolean', value: false, description: 'x')\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            "project('legacy', 'c')\na = dependency('libaaa', required: get_option('legacy'))\n",
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.optional), vec!["libaaa"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_override_dependency_is_a_provide_not_a_requirement() {
+        // the GLib shape: glib/girepository/meson.build ends with
+        //   meson.override_dependency('girepository-2.0', libgirepository_dep)
+        // — a declaration that THIS tree's own build provides the
+        // module. Misreading it as a dependency() call sends the
+        // resolver hunting for a module the tree already builds (the
+        // girepository-2.0 false positive).
+        let d = tmpdir("meson-override-dep");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('glib-like', 'c')
+subdir('girepository')
+subdir('user')
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("girepository")).unwrap();
+        fs::write(
+            d.join("girepository/meson.build"),
+            r#"libgirepository_dep = declare_dependency(
+  include_directories: include_directories('.'),
+)
+meson.override_dependency('girepository-2.0', libgirepository_dep)
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("user")).unwrap();
+        fs::write(
+            d.join("user/meson.build"),
+            r#"gir_dep = dependency('girepository-2.0', required: false)
+plain = dependency('zlib')
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // the override line contributed a PROVIDES entry...
+        assert!(
+            deps.provided_in_tree.contains(&"girepository-2.0".to_string()),
+            "override_dependency must register an in-tree provide"
+        );
+        // ...not a requirement of any kind
+        assert!(
+            !deps
+                .required
+                .iter()
+                .chain(deps.optional.iter())
+                .any(|x| x.name_norm == "girepository-2.0"
+                    && x.origin.starts_with("girepository/meson.build")),
+            "the override declaration itself must not be read as a dependency()"
+        );
+        // declare_dependency(...) is likewise never a dependency call
+        assert!(
+            !deps
+                .required
+                .iter()
+                .chain(deps.optional.iter())
+                .any(|x| x.origin.starts_with("girepository/meson.build")),
+            "declare_dependency has no string first argument: nothing from it"
+        );
+        // a sibling dependency('girepository-2.0') call is still a
+        // declaration (the planner satisfies it via provided_in_tree)
+        assert_eq!(names(&deps.optional), vec!["girepository-2.0"]);
+        assert_eq!(names(&deps.required), vec!["zlib"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_string_and_comment_content_is_never_a_call() {
+        // `dependency(` inside string literals and # comments is text,
+        // not a declaration (single-line strings included — the
+        // multi-line ''' form was already covered)
+        let d = tmpdir("meson-str-comment");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('strs2', 'c')
+s = 'dependency(''ghost-one'')'
+# dependency('ghost-two')
+msg = "use dependency('ghost-three') here"
+t = dependency('libreal')
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libreal"]);
+        for ghost in ["ghost-one", "ghost-two", "ghost-three"] {
+            assert!(
+                !deps
+                    .required
+                    .iter()
+                    .chain(deps.optional.iter())
+                    .any(|x| x.name_norm == ghost),
+                "{ghost} is string/comment content, not a dependency"
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_appstream_bash_completion_shape_is_required_by_default() {
+        // grounding: AppStream's contrib/meson.build declares
+        //   if get_option('bash-completion')       # boolean, default TRUE
+        //     bash_completion_dep = dependency('bash-completion', version: '>=2.0')
+        // A default build of AppStream genuinely requires it — the
+        // structural reading keeps it REQUIRED (the curated map, not a
+        // name filter, is what resolves it).
+        let d = tmpdir("meson-appstream-shape");
+        fs::write(
+            d.join("meson_options.txt"),
+            "option('bash-completion',\n       type: 'boolean',\n       value: true,\n       description: 'Bash completion')\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("meson.build"),
+            "project('appstream-like', 'c')\nif get_option('bash-completion')\n  bash_completion_dep = dependency('bash-completion', version: '>=2.0')\nendif\n",
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["bash-completion"]);
+        assert_eq!(names(&deps.optional), Vec::<String>::new());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_gtk_cairo_script_interpreter_shape_is_optional() {
+        // grounding: gtk4's meson.build declares
+        //   cairo_csi_dep = dependency('cairo-script-interpreter', required: false)
+        // — the opportunistic "use it if present" form
+        let d = tmpdir("meson-gtk-csi");
+        fs::write(
+            d.join("meson.build"),
+            "project('gtk-like', 'c')\ncairo_csi_dep = dependency('cairo-script-interpreter', required: false)\nif not cairo_csi_dep.found()\n  cairo_csi_dep = cc.find_library('cairo-script-interpreter', required: get_option('build-tests'))\nendif\n",
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), Vec::<String>::new());
+        assert_eq!(names(&deps.optional), vec!["cairo-script-interpreter"]);
+        let csi = deps.optional.first().unwrap();
+        assert_eq!(csi.optional_why.as_deref(), Some("required: false"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_foreach_dispatch_gates_backends_per_platform() {
+        // the GTK shape: backends dispatched by
+        //   foreach backend : ['android', 'broadway', 'wayland', 'win32', 'x11', 'macos']
+        //     if get_variable('@0@_enabled'.format(backend))
+        //       subdir(backend)
+        // with each flag computed from platform checks. The loop is
+        // unrolled per item: a backend whose flag is provably false for
+        // the scan platform is never entered — its tree's declarations
+        // (appleframeworks on the macos backend, DirectX-Headers on
+        // win32) must not surface on Linux, while live backends' do.
+        let d = tmpdir("meson-foreach-dispatch");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('gdk-like', 'c')
+x11_enabled    = false
+wayland_enabled = false
+macos_enabled  = false
+win32_enabled  = false
+if host_machine.system() == 'linux'
+  x11_enabled = true
+  wayland_enabled = true
+endif
+if host_machine.system() == 'darwin'
+  macos_enabled = true
+endif
+if host_machine.system() == 'windows'
+  win32_enabled = true
+endif
+subdir('gdk')
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("gdk")).unwrap();
+        fs::write(
+            d.join("gdk/meson.build"),
+            r#"foreach backend : ['android', 'broadway', 'wayland', 'win32', 'x11', 'macos']
+  if get_variable('@0@_enabled'.format(backend))
+    subdir(backend)
+    gdk_backends += get_variable('gdk_@0@'.format(backend))
+  endif
+endforeach
+"#,
+        )
+        .unwrap();
+        for (b, dep) in [("x11", "libxcb"), ("wayland", "wayland-client"), ("macos", "appleframeworks"), ("win32", "directx-headers")] {
+            fs::create_dir_all(d.join(format!("gdk/{b}"))).unwrap();
+            fs::write(
+                d.join(format!("gdk/{b}/meson.build")),
+                format!("gdk_{b}_deps = [dependency('{dep}')]\n"),
+            )
+            .unwrap();
+        }
+        // android/broadway backends have no dir: skipped silently
+
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libxcb", "wayland-client"]);
+        // the macos/win32 backends are provably dead on linux: their
+        // trees are excluded, not merely unreachable-and-rescanned
+        for gone in ["appleframeworks", "directx-headers"] {
+            assert!(
+                !deps
+                    .required
+                    .iter()
+                    .chain(deps.optional.iter())
+                    .any(|x| x.name_norm == gone),
+                "{gone} must not appear on a Linux scan (dead dispatch item)"
+            );
+        }
+        // ...and on darwin the SAME fixture surfaces the macos backend
+        // and drops x11/wayland — proving the exclusion follows the
+        // flags, not any name
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(names(&deps.required), vec!["appleframeworks"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_foreach_unrolls_bindings_for_required_kwargs() {
+        // foreach bindings also feed `required:` evaluation through the
+        // call-site scope snapshot: an item-gated optional dep keeps its
+        // verdict per the loop item's flag
+        let d = tmpdir("meson-foreach-req");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('loopreq', 'c')
+plugin_a_optional = false
+plugin_b_optional = true
+foreach plugin : ['plugin_a', 'plugin_b']
+  opt = get_variable('@0@_optional'.format(plugin))
+  if plugin == 'plugin_a'
+    p = dependency('plugin-a', required: opt)
+  else
+    p = dependency('plugin-b', required: opt)
+  endif
+endforeach
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        // per item: plugin-a's pass binds opt=false (optional),
+        // plugin-b's pass binds opt=true (required)
+        assert_eq!(names(&deps.required), vec!["plugin-b"]);
+        assert_eq!(names(&deps.optional), vec!["plugin-a"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_dead_branch_subdir_is_not_rescanned_by_the_fallback() {
+        // a subdir() inside a provably-dead branch (beyond foreach: a
+        // plain platform check) is provably never entered — the
+        // fallback must not resurrect its unconditional declarations
+        let d = tmpdir("meson-dead-subdir");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('deadsub', 'c')
+if host_machine.system() == 'darwin'
+  subdir('macos-stuff')
+endif
+base = dependency('zlib')
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("macos-stuff")).unwrap();
+        fs::write(
+            d.join("macos-stuff/meson.build"),
+            "fw = dependency('appleframeworks')\n",
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["zlib"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Manual validation against real upstream checkouts (not part of
+    /// the default suite — no network, no fixtures): point
+    /// GITFULL_REAL_TREE=<dir> at a meson project checkout and run with
+    /// `cargo test -- --ignored` to see its scan summary.
+    #[test]
+    #[ignore = "manual: set GITFULL_REAL_TREE to a meson checkout path"]
+    fn scan_real_upstream_tree() {
+        let Ok(dir) = std::env::var("GITFULL_REAL_TREE") else {
+            return;
+        };
+        let deps = scan(Path::new(&dir), BuildSystem::Meson).unwrap();
+        println!("== {dir} ==");
+        println!("required ({}):", deps.required.len());
+        for d in &deps.required {
+            println!(
+                "  {} {} [{}]{}",
+                d.name,
+                d.version.as_deref().unwrap_or(""),
+                d.origin,
+                d.git_url.as_deref().map(|u| format!(" ({u})")).unwrap_or_default()
+            );
+        }
+        println!("optional ({}):", deps.optional.len());
+        for d in &deps.optional {
+            println!(
+                "  {} [{}] ({})",
+                d.name,
+                d.origin,
+                d.optional_why.as_deref().unwrap_or("?")
+            );
+        }
+        println!("provided in tree: {:?}", deps.provided_in_tree);
+        println!("wraps: {:?}", deps.wraps.iter().map(|w| &w.name).collect::<Vec<_>>());
+        println!("vendored: {:?}", deps.vendored);
     }
 
     // ---- cmake: a typical C/C++ project ------------------------------------
