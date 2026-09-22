@@ -357,6 +357,35 @@ the `[dep.<name>]` pin syntax. Bare-name **application** installs
 there the user asked for "a popular repo matching this text", which is
 exactly what ranked search answers.
 
+### Anonymous generic remotes and auth rejections
+
+A URL whose host matches no `[forge.<name>]` entry is fetched as an
+**anonymous generic git remote**. The clone runs sealed — credential
+helpers reset on the command line (`-c credential.helper=`), empty
+sealed `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, redirected `HOME`,
+`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS` answering empty — and because
+no forge owns the host, **no token is attached at all**. `env_clear()`
+makes the child environment exactly that sealed set, so nothing
+ambient (a `GITHUB_TOKEN` in the session, a host credential helper,
+`GIT_CONFIG_*` injection vars) can reach the clone of an
+unconfigured host. A test observes the real spawned child (argv +
+environment, via a shim `git`) to pin this byte-for-byte.
+
+When a server answers such a clone with an authentication rejection,
+gitfull reports a dedicated `CloneAuth` error that names which of two
+very different situations occurred:
+
+* **anonymous** — "gitfull sent NO credentials": the *server* refused
+  anonymous access to that repository (auth-gated, moved, or gone).
+  This is not a credential leak: GitLab's canned `HTTP Basic: Access
+  denied` page is served to requests that carried no credentials at
+  all (the gitlab.freedesktop.org/appstream incident looked exactly
+  like a leaked PAT and was not one). Remedies are printed: pin an
+  anonymously-clonable upstream via `[dep.<name>]`, or register the
+  host as a `[forge.<name>]` with a `token_env`.
+* **tokened** — a configured forge's token was declined (value,
+  expiry, or scope); check that forge's `token_env` variable.
+
 ## Curated upstream map (libmap.rs)
 
 An **upstream source map** for well-known pkg-config module names —
@@ -378,7 +407,14 @@ repositories their maintainers actually publish from:
 * plain upstream clone URLs: hosts not registered as forges
   (gitlab.gnome.org, gitlab.freedesktop.org, …) are fetched as
   anonymous generic git remotes, so no forge configuration is needed
-  to use the map;
+  to use the map. This imposes a hard **audit criterion on every
+  entry: the source must be anonymously cloneable** — the generic
+  path attaches no credentials at all. The seed table has been
+  audited against the live hosts with sealed anonymous `git ls-remote`;
+  two entries failed and were corrected (`appstream` — fd.o's GitLab
+  serves its `HTTP Basic: Access denied` page to credential-less
+  requests even though the web UI is public — and `libwebp`, whose
+  `google/libwebp` repository no longer exists);
 * **not tuned to any test case**: no test fixture name appears in it,
   and no code path special-cases any entry — the mechanisms
   (curated-first ordering, flagged fallback, same-source dedup) are
@@ -426,6 +462,46 @@ Optional dependencies (per the manifest's own flags) are reported and
 never provisioned. Missing toolchains are never obtained from a host
 package manager (impossible — see the denylist); gitfull tells you the
 exact from-source command instead.
+
+### OPEN DESIGN DECISION — prebuilt binaries for foundational libraries
+
+**Status: flagged for the project owner. No direction is assumed or
+implemented here; gitfull today is strictly source-built, and this
+section records the open question, not a policy.**
+
+When a dependency resolves (via the curated map) to a foundational
+library with a large transitive graph — GTK → pango, harfbuzz, cairo,
+wayland, fontconfig, freetype, … — should gitfull keep building the
+*entire* chain from source on every fresh root, or prefer a prebuilt
+binary for such foundational libraries when one is safely obtainable,
+falling back to the full source build only when necessary?
+
+What is already true today, verified by tests and working at any
+depth:
+
+* the BFS walk handles arbitrarily deep transitive recursion and is
+  cycle-safe (a back-edge onto an ancestor is a hard error; diamond
+  edges deduplicate through the visited map);
+* the shared library cache applies across the whole depth: every
+  declared dependency at every level consults identity + `provides`
+  before any fetch, so each unique source is built once per root,
+  reused under every sibling name, with link closures carried along;
+* curated entries are per-deployment overridable via `[dep.<name>]`.
+
+The cost of source-only: a first install pulling GTK-scale trees
+spends a long time compiling libraries whose binaries are effectively
+identical for every consumer, and real-world manifests also contain
+names outside the curated seed (bash-completion, qt6, xmlb, libfyaml,
+…) that stop for a `[dep]` pin before anything builds.
+
+If a prebuilt tier is wanted, a sketch consistent with gitfull's
+principles — **for decision, not implemented**: opt-in per module
+(`[dep.<name>] prebuilt = "…"` or a curated prebuilt map) with pinned
+URLs + sha256, fetched with the same sealed/redacted treatment as
+toolchain tarballs and installed only into the sandbox; the source
+build remains the default and the fallback. The trust trade-off —
+building vs. executing downloaded binaries — is exactly what the
+project owner must rule on.
 
 ## Toolchain catalog & bootstrap
 

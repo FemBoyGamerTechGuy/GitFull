@@ -38,6 +38,24 @@ pub enum GitfullError {
         message: String,
     },
     Sandbox(String),
+    /// A git clone was rejected by the remote server as an authentication
+    /// failure. `anonymous` distinguishes the two very different causes:
+    /// gitfull's generic-remote clone sends **no credentials at all** (no
+    /// credential helper, empty gitconfig, prompts disabled — a token is
+    /// attached only to hosts with a `[forge.<name>]` entry), so an
+    /// anonymous rejection means the *server* gates that repository (the
+    /// GitLab "HTTP Basic: Access denied" page is exactly this case — it
+    /// reads like a client sent a bad password, when in fact nothing was
+    /// sent). A token rejection means a configured forge's token was
+    /// declined.
+    CloneAuth {
+        /// The credential-free URL (for display; never embeds a token).
+        url: String,
+        /// True when no token was attached to this clone.
+        anonymous: bool,
+        /// git's own stderr tail, for diagnosis.
+        tail: String,
+    },
     Exec {
         program: String,
         status: String,
@@ -76,6 +94,38 @@ impl fmt::Display for GitfullError {
                 write!(f, "toolchain[{component}]: {message}")
             }
             GitfullError::Sandbox(m) => write!(f, "sandbox error: {m}"),
+            GitfullError::CloneAuth {
+                url,
+                anonymous,
+                tail,
+            } => {
+                if *anonymous {
+                    write!(
+                        f,
+                        "clone of `{url}` was rejected by the server as an \
+                         authentication failure — but gitfull sent NO credentials \
+                         for this clone. Generic-remote clones are sealed \
+                         anonymous (credential helper disabled, empty gitconfig, \
+                         prompts off); a token is attached only to hosts with a \
+                         [forge.<name>] entry, and this host has none. The server \
+                         itself is refusing anonymous access to this repository \
+                         (auth-gated, moved, or gone). Remedies: pin an \
+                         anonymously-clonable upstream with [dep.<name>] \
+                         source = \"…\" in gitfull.conf, or add a [forge.<name>] \
+                         entry with this host and a token_env to clone it \
+                         authenticated.\ngit said:\n{tail}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "clone of `{url}` was rejected by the server: the token \
+                         attached for its configured forge was declined \
+                         (wrong value, expired, revoked, or missing scope for \
+                         this repository). Check the forge's token_env variable.\
+                         \ngit said:\n{tail}"
+                    )
+                }
+            }
             GitfullError::Exec {
                 program,
                 status,

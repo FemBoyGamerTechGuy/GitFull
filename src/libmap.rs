@@ -44,7 +44,12 @@
 //! Entries are plain upstream clone URLs. Hosts that are not configured
 //! as forges in gitfull.conf are fetched as anonymous generic git
 //! remotes (see `planner::resolve_source`) — no forge registration is
-//! required to use the map.
+//! required to use the map. That contract has a consequence: **every
+//! source must be anonymously cloneable** (the generic-remote path sends
+//! no credentials at all). The seed table has been audited against the
+//! live hosts with sealed anonymous `git ls-remote` — see the
+//! `curated_sources_are_anonymously_clonable_upstreams` test for the two
+//! entries that audit corrected.
 //!
 //! # Same-source deduplication
 //!
@@ -128,7 +133,11 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "pangoxft", source: "https://gitlab.gnome.org/GNOME/pango", git_ref: None, label: "Pango (xft renderer)" },
     CuratedEntry { module: "pixman-1", source: "https://gitlab.freedesktop.org/pixman/pixman", git_ref: None, label: "Pixman" },
     // ---- GNOME platform ----------------------------------------------------
-    CuratedEntry { module: "appstream", source: "https://gitlab.freedesktop.org/appstream/appstream", git_ref: None, label: "AppStream" },
+    CuratedEntry { module: "appstream", source: "https://github.com/ximion/appstream", git_ref: None, label: "AppStream" },
+    // NOTE: gitlab.freedesktop.org/appstream/appstream serves GitLab's
+    // "HTTP Basic: Access denied" page to fully anonymous git-HTTP requests
+    // (web UI public, repository access gated) — the real upstream is the
+    // GitHub repository above; verified anonymously clonable.
     CuratedEntry { module: "appstream-glib", source: "https://github.com/hughsie/appstream-glib", git_ref: None, label: "AppStream-GLib" },
     CuratedEntry { module: "gee-0.8", source: "https://gitlab.gnome.org/GNOME/libgee", git_ref: None, label: "libgee" },
     CuratedEntry { module: "gobject-introspection-1.0", source: "https://gitlab.gnome.org/GNOME/gobject-introspection", git_ref: None, label: "gobject-introspection" },
@@ -155,8 +164,11 @@ pub const CURATED: &[CuratedEntry] = &[
     CuratedEntry { module: "libtiff-4", source: "https://gitlab.com/libtiff/libtiff", git_ref: None, label: "libtiff" },
     CuratedEntry { module: "libturbojpeg", source: "https://github.com/libjpeg-turbo/libjpeg-turbo", git_ref: None, label: "libjpeg-turbo (TurboJPEG API)" },
     CuratedEntry { module: "libuv", source: "https://github.com/libuv/libuv", git_ref: None, label: "libuv" },
-    CuratedEntry { module: "libwebp", source: "https://github.com/google/libwebp", git_ref: None, label: "libwebp" },
-    CuratedEntry { module: "libsharpyuv", source: "https://github.com/google/libwebp", git_ref: None, label: "libwebp (sharpyuv)" },
+    CuratedEntry { module: "libwebp", source: "https://github.com/webmproject/libwebp", git_ref: None, label: "libwebp" },
+    // NOTE: github.com/google/libwebp is gone (404 "Repository not found");
+    // the project's GitHub home is the webmproject org, and sharpyuv
+    // builds from the libwebp tree itself.
+    CuratedEntry { module: "libsharpyuv", source: "https://github.com/webmproject/libwebp", git_ref: None, label: "libwebp (sharpyuv)" },
     CuratedEntry { module: "openssl", source: "https://github.com/openssl/openssl", git_ref: None, label: "OpenSSL" },
     CuratedEntry { module: "sqlite3", source: "https://github.com/sqlite/sqlite", git_ref: None, label: "SQLite" },
     CuratedEntry { module: "zlib", source: "https://github.com/madler/zlib", git_ref: None, label: "zlib" },
@@ -304,8 +316,51 @@ mod tests {
             &["wayland-client", "wayland-server", "wayland-scanner"][..],
             &["harfbuzz", "harfbuzz-subset", "harfbuzz-icu"][..],
             &["openssl", "libssl", "libcrypto"][..],
+            &["libwebp", "libsharpyuv"][..],
         ] {
             assert_eq!(distinct_sources(family).len(), 1, "{family:?}");
+        }
+    }
+
+    /// The generic-remote contract of this table: every source must be
+    /// **anonymously cloneable**, because a host without a `[forge.<name>]`
+    /// entry is fetched with zero credentials.
+    ///
+    /// Audited live (sealed anonymous `git ls-remote`, no credentials, no
+    /// helper — the exact invocation gitfull's generic-remote path makes):
+    /// 44 of 46 distinct sources answered anonymously. The two failures
+    /// were exactly the class of bug this test pins:
+    ///
+    /// * `gitlab.freedesktop.org/appstream/appstream` — the server responds
+    ///   with GitLab's `HTTP Basic: Access denied` page **to a request that
+    ///   carried no credentials at all** (its web UI is public; its git-HTTP
+    ///   is auth-gated). That canned page misleadingly reads like a client
+    ///   sent a bad password — it is the server refusing anonymous access.
+    ///   Corrected to the real upstream, github.com/ximion/appstream.
+    /// * `github.com/google/libwebp` — repository gone (404); libwebp now
+    ///   lives in the webmproject org (sharpyuv builds from that same
+    ///   tree). Corrected both module entries.
+    #[test]
+    fn curated_sources_are_anonymously_clonable_upstreams() {
+        for (module, expected) in [
+            ("appstream", "https://github.com/ximion/appstream"),
+            ("libwebp", "https://github.com/webmproject/libwebp"),
+            ("libsharpyuv", "https://github.com/webmproject/libwebp"),
+        ] {
+            assert_eq!(
+                lookup(module).map(|e| e.source),
+                Some(expected),
+                "`{module}` must point at its anonymously-clonable upstream"
+            );
+        }
+        // the anonymous contract itself: no curated URL may embed
+        // credentials of any kind (userinfo, token hints)
+        for e in CURATED {
+            let rest = e.source.strip_prefix("https://").unwrap_or(e.source);
+            assert!(!rest.contains('@'), "userinfo in curated source: {}", e.source);
+            let low = e.source.to_ascii_lowercase();
+            assert!(!low.contains("token"), "token hint in curated source: {}", e.source);
+            assert!(!low.contains("oauth"), "oauth hint in curated source: {}", e.source);
         }
     }
 }

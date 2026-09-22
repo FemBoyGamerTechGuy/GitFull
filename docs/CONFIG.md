@@ -173,7 +173,15 @@ table does not seed gets pinned here the same way.
 git URL, or a local path. URLs on hosts not registered as forges
 (e.g. `https://gitlab.gnome.org/GNOME/libgee`) are cloned as anonymous
 generic git remotes, so pinning an upstream that is not a configured
-forge needs no extra configuration.
+forge needs no extra configuration. Anonymous means exactly that: no
+credential, no helper, no token is attached (a token would never be
+sent to a host without a `[forge.<name>]` entry). If the server
+refuses anonymous access to such a repository — some hosts auth-gate
+git-HTTP on otherwise-public projects — the install stops with a
+dedicated `CloneAuth` error that says gitfull sent **no credentials**,
+and offers the two remedies: repin the `[dep.<name>]` `source` at an
+anonymously-clonable upstream, or register the host as
+`[forge.<name>]` with a `token_env` to clone it authenticated.
 
 ### The search fallback never auto-builds
 

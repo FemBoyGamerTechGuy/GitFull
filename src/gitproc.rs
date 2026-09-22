@@ -450,11 +450,35 @@ pub fn git_env(home: &Path, host_tool_path: &str) -> Vec<(String, String)> {
     env
 }
 
+/// Does a failed clone's stderr tail look like an authentication
+/// rejection? Matches the server-side and git-side phrasings observed in
+/// the wild, including the GitLab **"HTTP Basic: Access denied"** page —
+/// which a fully anonymous, credential-less request can receive (the
+/// gitlab.freedesktop.org/appstream incident): GitLab serves that canned
+/// auth-error page whenever it decides git-HTTP needs authentication,
+/// regardless of whether the client offered credentials. A plain tail
+/// match is the honest classification — the *anonymous vs tokened*
+/// distinction (and the right remedy) is decided by the caller from
+/// whether a token was actually attached.
+pub fn clone_tail_is_auth_rejection(tail: &str) -> bool {
+    let t = tail.to_ascii_lowercase();
+    t.contains("access denied")
+        || t.contains("authentication failed")
+        || t.contains("could not read username")
+        || t.contains("terminal prompts disabled")
+}
+
 /// Clone `url` into `dest` with gitfull's live progress UI.
 ///
 /// `git` runs as a **sealed fetch tool**: disabled credential helpers, no
 /// system/global gitconfig, redirected HOME, no terminal prompts. Its only
 /// writes go to `dest` (inside a sandbox or the cache).
+///
+/// On failure, a tail that looks like an authentication rejection is
+/// reclassified into [`GitfullError::CloneAuth`] — anonymous clones then
+/// fail with an error that states, affirmatively, that **no credentials
+/// were sent** (the server refused anonymous access), instead of the raw
+/// remote message that reads exactly like a leaked-credential bug.
 pub fn git_clone(
     ctx: &ExecCtx,
     url: &RemoteUrl,
@@ -496,7 +520,7 @@ pub fn git_clone(
     }
 
     let env = git_env(git_home, host_tool_path);
-    run_stream_stderr(
+    let res = run_stream_stderr(
         &ctx,
         &argv,
         ExecClass::FetchTool,
@@ -509,7 +533,17 @@ pub fn git_clone(
                 }
             }
         },
-    )
+    );
+    if let Err(GitfullError::Exec { tail, .. }) = &res {
+        if clone_tail_is_auth_rejection(tail) {
+            return Err(GitfullError::CloneAuth {
+                url: url.clean.clone(),
+                anonymous: url.token.is_none(),
+                tail: tail.clone(),
+            });
+        }
+    }
+    res
 }
 
 /// `git ls-remote --tags <url> <pattern>` — used to auto-resolve the
@@ -701,6 +735,392 @@ fn parse_http_include(raw: &str) -> HttpResponse {
         status,
         headers,
         body: body.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod sealed_clone_tests {
+    use super::*;
+    use crate::config::CloneSection;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Run a test body under a HARD deadline: a regression that turns a
+    /// clone into a blocking read (the packaging-pipeline hang failure
+    /// mode) fails loudly here instead of hanging the runner.
+    fn with_deadline<T: Send + 'static>(secs: u64, body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(body());
+            })
+            .expect("spawn watchdog worker");
+        rx.recv_timeout(Duration::from_secs(secs)).unwrap_or_else(|_| {
+            panic!(
+                "test body did not finish within {secs}s — a blocking \
+                 operation (network read, prompt) hung; tests must never hang"
+            )
+        })
+    }
+
+    /// A fake `git` that records the exact argv and environment it was
+    /// executed with into `$HOME/shim-argv` / `$HOME/shim-env` and exits 0.
+    /// `$HOME` is gitfull's sealed git home, so the dumps land where the
+    /// test can read them — this observes the REAL spawned child, not a
+    /// reconstruction of it.
+    fn write_git_shim(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        let shim = dir.join("git");
+        fs::write(
+            &shim,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/shim-argv\"\n/usr/bin/env > \"$HOME/shim-env\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn temp_case(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "gitfull-gitproc-{}-{}-{name}",
+            std::process::id(),
+            epoch()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// THE exact-invocation proof for the incident report: an anonymous
+    /// generic-remote clone must carry **zero credentials** on either side
+    /// of the exec — no token in argv, no ambient secret in the child
+    /// environment, no credential helper, empty global config, prompts
+    /// off — while a decoy GitHub PAT sits in gitfull's own environment
+    /// (the "stale credential / leaked PAT" hypothesis). What the shim
+    /// records is what git would have seen; nothing else exists.
+    #[test]
+    fn anonymous_generic_clone_sends_no_credentials() {
+        let dir = temp_case("anon");
+        let shim_dir = dir.join("shim");
+        let git_home = dir.join("githome");
+        let dest_parent = dir.join("sbx");
+        fs::create_dir_all(&git_home).unwrap();
+        fs::create_dir_all(&dest_parent).unwrap();
+        write_git_shim(&shim_dir);
+
+        // the decoy: a PAT-looking secret in gitfull's OWN environment
+        let sentinel = "ghp_DecoySentinelNotARealToken";
+        std::env::set_var("GITHUB_TOKEN", sentinel);
+        std::env::set_var("GITFULL_TEST_SENTINEL_PAT", sentinel);
+
+        let ctx = ExecCtx {
+            audit_log: Some(dir.join("audit.log")),
+            redactions: Vec::new(),
+            resolve_path: format!("{}:/usr/bin:/bin", shim_dir.display()),
+            interactive_override: Some(false),
+            ..ExecCtx::default()
+        };
+        let url = "https://gitlab.freedesktop.org/appstream/appstream";
+        let remote = authed_url(url, None);
+
+        let ctx2 = ctx.clone();
+        let remote2 = remote.clone();
+        let dest = dest_parent.join("repo");
+        let tool_path = format!("{}:/usr/bin:/bin", shim_dir.display());
+        let git_home2 = git_home.clone();
+        let res = with_deadline(30, move || {
+            git_clone(
+                &ctx2,
+                &remote2,
+                &dest,
+                None,
+                &CloneSection::default(),
+                &tool_path,
+                &git_home2,
+                None,
+            )
+        });
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GITFULL_TEST_SENTINEL_PAT");
+        res.expect("shim git exits 0");
+
+        // ---- the argv git was actually executed with -------------------
+        let argv = fs::read_to_string(git_home.join("shim-argv")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert!(
+            args.contains(&"credential.helper="),
+            "credential helpers must be reset on the command line: {args:?}"
+        );
+        assert!(
+            args.contains(&"--progress"),
+            "clone progress expected: {args:?}"
+        );
+        assert!(
+            args.contains(&url),
+            "the CLEAN url must be the clone target: {args:?}"
+        );
+        assert!(
+            !argv.contains("x-access-token:"),
+            "no token may be embedded in the URL: {argv}"
+        );
+        assert!(
+            !argv.contains(sentinel),
+            "the ambient PAT must not appear anywhere in argv: {argv}"
+        );
+
+        // ---- the environment git was actually executed under -----------
+        let env_dump = fs::read_to_string(git_home.join("shim-env")).unwrap();
+        let mandatory = [
+            ("GIT_TERMINAL_PROMPT=0", "terminal prompts disabled"),
+            ("GIT_CONFIG_NOSYSTEM=1", "system gitconfig invisible"),
+        ];
+        for (needle, why) in mandatory {
+            assert!(env_dump.contains(needle), "{why} missing: {env_dump}");
+        }
+        let global = format!("GIT_CONFIG_GLOBAL={}", git_home.join(".gitconfig").display());
+        assert!(
+            env_dump.contains(&global),
+            "global config must be the sealed empty file: {env_dump}"
+        );
+        let home_line = format!("HOME={}", git_home.display());
+        assert!(env_dump.contains(&home_line), "HOME must be redirected: {env_dump}");
+        assert!(
+            env_dump.contains("GIT_ASKPASS=/usr/bin/true"),
+            "askpass must answer every credential prompt with nothing: {env_dump}"
+        );
+        assert!(
+            !env_dump.contains(sentinel),
+            "the ambient PAT must not leak into the child env: {env_dump}"
+        );
+        assert!(
+            !env_dump.contains("GITHUB_TOKEN="),
+            "no ambient token var may pass env_clear: {env_dump}"
+        );
+        // the allowlist: git_env's own keys, proxy pass-through, and the
+        // shell's own bookkeeping — NOTHING else may cross env_clear()
+        let allowed: &[&str] = &[
+            "HOME", "PATH", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
+            "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "PWD", "SHLVL", "OLDPWD", "IFS",
+            "PS1", "PS2", "_", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        ];
+        for line in env_dump.lines() {
+            let key = line.split('=').next().unwrap_or("");
+            assert!(
+                allowed.contains(&key),
+                "unexpected env key `{key}` crossed env_clear(): {env_dump}"
+            );
+        }
+        // the sealed global config itself: present and EMPTY
+        let gitconfig = git_home.join(".gitconfig");
+        assert!(gitconfig.is_file(), "sealed gitconfig must exist");
+        assert_eq!(
+            fs::read_to_string(&gitconfig).unwrap(),
+            "",
+            "sealed gitconfig must be empty"
+        );
+
+        // ---- audit log: the invocation, redacted -------------------------
+        let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
+        assert!(audit.contains("fetch-tool"), "class logged: {audit}");
+        assert!(
+            !audit.contains(sentinel),
+            "secrets must never reach the audit log: {audit}"
+        );
+    }
+
+    /// The contrast arm: a clone of a forge-configured host DOES embed the
+    /// token in the child argv (its only legitimate channel) — and the
+    /// audit log then shows the token REDACTED. Scoping: token attached
+    /// exactly when a forge supplied one, never otherwise.
+    #[test]
+    fn forge_token_lives_only_in_child_argv_and_is_redacted_in_logs() {
+        let dir = temp_case("authed");
+        let shim_dir = dir.join("shim");
+        let git_home = dir.join("githome");
+        let dest_parent = dir.join("sbx");
+        fs::create_dir_all(&git_home).unwrap();
+        fs::create_dir_all(&dest_parent).unwrap();
+        write_git_shim(&shim_dir);
+
+        let ctx = ExecCtx {
+            audit_log: Some(dir.join("audit.log")),
+            redactions: Vec::new(),
+            resolve_path: format!("{}:/usr/bin:/bin", shim_dir.display()),
+            interactive_override: Some(false),
+            ..ExecCtx::default()
+        };
+        let token = "ghp_SentinelForgeToken42";
+        let remote = authed_url("https://github.com/acme/widgets.git", Some(token));
+        assert_eq!(remote.clean, "https://github.com/acme/widgets.git");
+        assert_eq!(
+            remote.authed,
+            format!("https://x-access-token:{token}@github.com/acme/widgets.git")
+        );
+
+        git_clone(
+            &ctx,
+            &remote,
+            &dest_parent.join("repo"),
+            None,
+            &CloneSection::default(),
+            &format!("{}:/usr/bin:/bin", shim_dir.display()),
+            &git_home,
+            None,
+        )
+        .expect("shim git exits 0");
+
+        let argv = fs::read_to_string(git_home.join("shim-argv")).unwrap();
+        assert!(
+            argv.contains(&remote.authed),
+            "the authed URL is the ONE place the token exists: {argv}"
+        );
+        let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
+        assert!(
+            audit.contains("REDACTED"),
+            "the audit log must redact the token: {audit}"
+        );
+        assert!(!audit.contains(token), "token leaked into audit log: {audit}");
+    }
+
+    /// The classifier against the exact stderr captured from the incident
+    /// (gitlab.freedesktop.org/appstream/appstream, sealed anonymous env,
+    /// zero credentials — reproduced 2026-09) plus the other auth-rejection
+    /// phrasings git and the forges produce.
+    #[test]
+    fn clone_failure_tail_is_classified_as_auth_rejection() {
+        // verbatim incident capture: the GitLab page body relayed as
+        // `remote:` lines, then git's own fatal line
+        let incident = "Cloning into '/tmp/astream-clone'...\n\
+            remote: HTTP Basic: Access denied. If a password was provided for \
+            Git authentication, the password was incorrect or you're required \
+            to use a token instead of a password. If a token was provided, it \
+            was either incorrect, expired, or improperly scoped.\n\
+            fatal: Authentication failed for \
+            'https://gitlab.freedesktop.org/appstream/appstream.git/'";
+        assert!(clone_tail_is_auth_rejection(incident));
+
+        // the other real phrasings
+        assert!(clone_tail_is_auth_rejection(
+            "fatal: could not read Username for 'https://x': No such device or address"
+        ));
+        assert!(clone_tail_is_auth_rejection(
+            "fatal: could not read Username for 'https://x': terminal prompts disabled"
+        ));
+        assert!(clone_tail_is_auth_rejection(
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://x'"
+        ));
+
+        // non-auth failures must NOT be classified as credential problems
+        assert!(!clone_tail_is_auth_rejection(
+            "fatal: unable to access 'https://x/': gnutls_handshake() failed"
+        ));
+        assert!(!clone_tail_is_auth_rejection(
+            "error: RPC failed; curl 56 Recv failure: Connection was reset"
+        ));
+        assert!(!clone_tail_is_auth_rejection(
+            "fatal: destination path '/x' already exists and is not an empty directory."
+        ));
+        assert!(!clone_tail_is_auth_rejection(""));
+    }
+
+    /// End-to-end through the REAL git binary: a server that answers
+    /// anonymous git-HTTP with GitLab's auth-gate (401 + Basic challenge +
+    /// the "HTTP Basic: Access denied" body) must produce the dedicated
+    /// CloneAuth error for an anonymous generic remote — affirmatively
+    /// stating that NO credentials were sent, with the two remedies —
+    /// instead of the raw remote message that reads like a credential
+    /// leak. Localhost only; hard deadline; never prompts (prompting is
+    /// disabled in the sealed env, and GIT_ASKPASS answers empty).
+    #[test]
+    fn auth_rejected_anonymous_clone_explains_that_no_credentials_were_sent() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = temp_case("deny");
+        let git_home = dir.join("githome");
+        fs::create_dir_all(&git_home).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = match conn {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let body = "HTTP Basic: Access denied. If a password was \
+                            provided for Git authentication, the password was \
+                            incorrect or you're required to use a token instead \
+                            of a password.";
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic \
+                     realm=\"GitLab\"\r\nContent-Type: text/html\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = conn.write_all(resp.as_bytes());
+                let _ = conn.flush();
+            }
+        });
+
+        let ctx = ExecCtx {
+            audit_log: Some(dir.join("audit.log")),
+            redactions: Vec::new(),
+            resolve_path: "/usr/bin:/bin".to_string(),
+            interactive_override: Some(false),
+            ..ExecCtx::default()
+        };
+        let url = format!("http://127.0.0.1:{port}/appstream/appstream.git");
+        let remote = authed_url(&url, None);
+
+        let ctx2 = ctx.clone();
+        let remote2 = remote.clone();
+        let dest = dir.join("repo");
+        let git_home2 = git_home.clone();
+        let err = with_deadline(90, move || {
+            git_clone(
+                &ctx2,
+                &remote2,
+                &dest,
+                None,
+                &CloneSection::default(),
+                "/usr/bin:/bin",
+                &git_home2,
+                None,
+            )
+            .unwrap_err()
+        });
+        match &err {
+            GitfullError::CloneAuth {
+                url: u,
+                anonymous,
+                tail,
+            } => {
+                assert_eq!(u, &url, "the error reports the credential-free URL");
+                assert!(*anonymous, "this clone attached no token");
+                assert!(
+                    tail.to_ascii_lowercase().contains("authentication failed")
+                        || tail.to_ascii_lowercase().contains("denied"),
+                    "git's own tail kept for diagnosis: {tail}"
+                );
+            }
+            other => panic!("expected CloneAuth, got {other:?}"),
+        }
+        let msg = format!("{err}");
+        assert!(msg.contains("NO credentials"), "{msg}");
+        assert!(msg.contains("[forge."), "{msg}");
+        assert!(msg.contains("[dep."), "{msg}");
+        // and it must NOT look like the raw leak-style message anymore
+        assert!(!msg.starts_with("remote: HTTP Basic"), "{msg}");
     }
 }
 

@@ -130,6 +130,7 @@ fn write_meta(path: &Path, rec: &InstallRecord) -> Result<()> {
 // source resolution
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum ResolvedSource {
     Git {
         forge_name: String,
@@ -2362,6 +2363,86 @@ mod tests {
             }
         }
         assert_eq!(identities.len(), 1, "{identities:?}");
+    }
+
+    /// Token scoping, the incident-report arm: a GitHub PAT sitting in the
+    /// environment (its forge even configured, with `token_env`) must be
+    /// attached ONLY to clones of that forge's own host. A URL on an
+    /// unconfigured host resolves to a strictly credential-free generic
+    /// remote — `authed == clean`, token `None` — so nothing about the
+    /// PAT can be presented to a host it has no relationship with.
+    #[test]
+    fn generic_remote_resolution_attaches_no_token_even_with_one_in_env() {
+        let dir = std::env::temp_dir().join(format!(
+            "gitfull-planner-scope-{}-{}",
+            std::process::id(),
+            util::epoch()
+        ));
+        std::fs::create_dir_all(dir.join("root")).unwrap();
+        let conf = format!(
+            "[core]\nroot = \"{}\"\nbin_dir = \"{}\"\n\n\
+             [forge.github]\nkind = \"github\"\nhost = \"fake.invalid\"\n\
+             api_base = \"https://fake.invalid\"\ntoken_env = \"GITFULL_TEST_SCOPE_PAT\"\n",
+            dir.join("root").display(),
+            dir.join("bin").display()
+        );
+        let path = dir.join("gitfull.conf");
+        std::fs::write(&path, conf).unwrap();
+        let (cfg, warns) = Config::load(&path).unwrap();
+        assert!(warns.is_empty(), "{warns:?}");
+
+        std::env::set_var("GITFULL_TEST_SCOPE_PAT", "pat-scope-sentinel-xyz");
+
+        // the PAT IS resolvable for the configured forge…
+        let gh = cfg.forges.get("github").unwrap();
+        assert_eq!(
+            forge_token(gh).as_deref(),
+            Some("pat-scope-sentinel-xyz"),
+            "precondition: the token is visible to the configured forge"
+        );
+
+        // …but a URL on a host with NO [forge] entry resolves credential-free
+        let spec = crate::spec::PkgSpec::parse("https://gitlab.freedesktop.org/x/y")
+            .expect("url spec parses");
+        let resolved = resolve_source(&cfg, &spec).expect("generic resolution");
+        match resolved {
+            ResolvedSource::Git {
+                forge_name,
+                url,
+                git_ref,
+                ..
+            } => {
+                assert_eq!(forge_name, "generic");
+                assert!(git_ref.is_none());
+                assert!(
+                    url.token.is_none(),
+                    "no token may exist on a generic remote"
+                );
+                assert_eq!(url.authed, url.clean, "authed must equal clean");
+                assert_eq!(
+                    url.clean, "https://gitlab.freedesktop.org/x/y",
+                    "the URL passes through untouched"
+                );
+            }
+            other => panic!("expected a generic Git source, got {other:?}"),
+        }
+
+        // contrast arm: the configured forge's OWN host does get the token —
+        // scoping means "exactly where it belongs", not "nowhere"
+        let gh_spec =
+            crate::spec::PkgSpec::parse("https://fake.invalid/acme/widgets.git").unwrap();
+        match resolve_source(&cfg, &gh_spec).expect("forge resolution") {
+            ResolvedSource::Git { url, .. } => {
+                assert_eq!(
+                    url.authed,
+                    "https://x-access-token:pat-scope-sentinel-xyz@fake.invalid/acme/widgets.git",
+                    "the forge's own host receives the token in the authed URL"
+                );
+                assert_eq!(url.clean, "https://fake.invalid/acme/widgets.git");
+            }
+            other => panic!("expected a forge Git source, got {other:?}"),
+        }
+        std::env::remove_var("GITFULL_TEST_SCOPE_PAT");
     }
 
     /// The gate itself: a non-TTY context may NEVER build a search
