@@ -7,7 +7,7 @@
 //!
 //! | build system | files parsed                                    | declarations recognized                                     |
 //! |--------------|-------------------------------------------------|-------------------------------------------------------------|
-//! | meson        | every `meson.build`, plus `subprojects/*.wrap`  | `dependency('name', ...)` calls; `.wrap` subprojects (git or file) |
+//! | meson        | every `meson.build`, plus `subprojects/*.wrap`  | `dependency('name', ...)` calls **in their conditional context** (see [`crate::mesoneval`]: `if`/`elif`/`else`, `host_machine.system()` & friends — deps provably unreachable for this platform are not surfaced); `.wrap` subprojects (git or file) |
 //! | cmake        | every `CMakeLists.txt` and `*.cmake`            | `find_package(Name)`, `find_library(... NAMES x ...)`, `pkg_check_modules(... mods)` |
 //! | cargo        | `Cargo.toml` (workspace members too)            | `[dependencies]` / `[build-dependencies]` / `[target...]` (+ git deps) |
 //! | autotools    | `configure.ac`                                  | `PKG_CHECK_MODULES`, `AC_CHECK_LIB`, `AC_SEARCH_LIBS`       |
@@ -178,8 +178,8 @@ pub const CMAKE_BUILTINS: &[&str] = &[
 /// compiler runtime delivered by the toolchain's gcc (the classic
 /// libc helper libraries).
 pub const LIBC_LIBS: &[&str] = &[
-    "c", "m", "dl", "pthread", "rt", "intl", "gcc", "gcc_s", "supc++", "socket", "nsl",
-    "resolv", "crypt",
+    "c", "m", "dl", "pthread", "rt", "intl", "gcc", "gcc_s", "supc++", "socket", "nsl", "resolv",
+    "crypt",
 ];
 
 fn normalize_name(s: &str) -> String {
@@ -247,6 +247,16 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>, want: &dyn Fn(&str) -> bool, s
 // ---------------------------------------------------------------------------
 
 fn scan_meson(src: &Path) -> Result<DeclaredDeps> {
+    scan_meson_for(src, &crate::mesoneval::current_system())
+}
+
+/// Scan a meson tree for an explicit target platform (a meson
+/// `system()` name like `linux`, `darwin`, `windows`). Production
+/// scans use the machine gitfull runs on ([`mesoneval::current_system`]
+/// — gitfull builds natively); tests pin other platforms to prove a
+/// gated dependency is excluded when its platform does not match and
+/// included when it does.
+fn scan_meson_for(src: &Path, system: &str) -> Result<DeclaredDeps> {
     let mut deps = DeclaredDeps::default();
 
     // wraps first: they self-describe sources and provided names
@@ -274,24 +284,63 @@ fn scan_meson(src: &Path) -> Result<DeclaredDeps> {
         }
     }
 
-    // dependency() calls in every meson.build (subprojects/ trees are
-    // managed via wraps — their own manifests are not the project's
-    // declarations)
+    // dependency() calls in every meson.build, in conditional context:
+    // the root file plus every statically-reachable subdir() child is
+    // evaluated with ONE shared variable scope in meson's execution
+    // order (subdir() runs in the caller's scope — that is how GLib
+    // gates `dependency('appleframeworks')` in subdir files on a
+    // variable the root computes as darwin-only). subprojects/ trees
+    // are managed via wraps — their own manifests are not the
+    // project's declarations.
+    let root = src.join("meson.build");
+    let analyzed = if root.is_file() {
+        crate::mesoneval::eval_project(&root, system)
+    } else {
+        Vec::new()
+    };
+    let seen: BTreeSet<PathBuf> = analyzed.iter().map(|f| f.path.clone()).collect();
+    for fe in &analyzed {
+        let origin_base = relativize(&fe.path, src);
+        parse_meson_dependency_calls(fe, &origin_base, &mut deps);
+    }
+
+    // fallback: meson.build files NOT reachable through static
+    // subdir() calls (dynamic `subdir(var)` paths, foreach-driven
+    // subdirs) — evaluated with an isolated scope so their
+    // unconditional declarations are still reported, and their own
+    // conditionals are still honored
     let mut builds: Vec<PathBuf> = Vec::new();
     walk_files(src, &mut builds, &|n| n == "meson.build", &["subprojects"]);
     for f in builds {
-        let text = fs::read_to_string(&f).unwrap_or_default();
-        let origin_base = f.strip_prefix(src).unwrap_or(&f).display().to_string();
-        parse_meson_dependency_calls(&text, &origin_base, &mut deps);
+        if seen.contains(&f) {
+            continue;
+        }
+        let fe = crate::mesoneval::eval_isolated(&f, system);
+        let origin_base = relativize(&f, src);
+        parse_meson_dependency_calls(&fe, &origin_base, &mut deps);
     }
     Ok(deps)
 }
 
+/// `path` relative to the tree root, for `file:line` origins.
+fn relativize(p: &Path, src: &Path) -> String {
+    p.strip_prefix(src).unwrap_or(p).display().to_string()
+}
+
 /// Extract `dependency('name', ...)` calls (including multi-line ones)
-/// with their salient kwargs. Also records `subproject('x')`-style
-/// references implicitly: a name provided by a wrap is fetched via the
-/// wrap (see [`DeclaredDeps::wrap_provided`]).
-fn parse_meson_dependency_calls(text: &str, origin_base: &str, deps: &mut DeclaredDeps) {
+/// with their salient kwargs — but only from statements **reachable for
+/// the platform the tree was evaluated for**
+/// ([`FileEval::statement_active_at`]): a call inside a provably-dead
+/// branch (`if host_machine.system() == 'darwin'` when scanning for
+/// Linux) is not a dependency of this build at all. Also records
+/// `subproject('x')`-style references implicitly: a name provided by a
+/// wrap is fetched via the wrap (see [`DeclaredDeps::wrap_provided`]).
+fn parse_meson_dependency_calls(
+    fe: &crate::mesoneval::FileEval,
+    origin_base: &str,
+    deps: &mut DeclaredDeps,
+) {
+    let text = &fe.text;
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while let Some(rel) = find_sub(bytes, i, b"dependency(") {
@@ -323,8 +372,12 @@ fn parse_meson_dependency_calls(text: &str, origin_base: &str, deps: &mut Declar
             j += 1;
         }
         let call = &text[start..j.saturating_sub(1).max(start)];
-        let line = 1 + text[..rel].matches('\n').count();
-        record_meson_call(call, &format!("{origin_base}:{line}"), deps);
+        // conditional context: only a statement that can execute on
+        // the scanned platform declares a dependency of this build
+        if fe.statement_active_at(rel) {
+            let line = 1 + text[..rel].matches('\n').count();
+            record_meson_call(call, &format!("{origin_base}:{line}"), deps);
+        }
         i = j.max(rel + 1);
     }
 }
@@ -349,8 +402,9 @@ fn record_meson_call(call: &str, origin: &str, deps: &mut DeclaredDeps) {
     }
     // kwargs of interest: required: false / version: '...'
     let lower = call.to_ascii_lowercase();
-    let required =
-        !lower.contains("required") || lower.contains("required: true") || lower.contains("required : true");
+    let required = !lower.contains("required")
+        || lower.contains("required: true")
+        || lower.contains("required : true");
     let version = extract_kwarg_string(call, "version");
     let d = DeclaredDep {
         name: name.clone(),
@@ -412,7 +466,9 @@ pub fn parse_wrap(path: &Path) -> Result<Option<WrapDep>> {
             section = line[1..line.len() - 1].trim().to_string();
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         match (section.as_str(), k) {
             ("wrap-git", "url") | ("wrap-git", "repository_url") => {
@@ -490,30 +546,35 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
         .collect::<Vec<_>>()
         .join("\n");
     let lower = clean.to_ascii_lowercase();
-    let mut push = |name: &str, kind: DepKind, required: bool, version: Option<String>, line: usize| {
-        let name = name.trim();
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')) {
-            return;
-        }
-        let norm = normalize_name(name);
-        if CMAKE_BUILTINS.contains(&norm.as_str()) {
-            return; // toolchain-provided (threads, python interpreter, ...)
-        }
-        let d = DeclaredDep {
-            name: name.to_string(),
-            name_norm: norm,
-            kind,
-            required,
-            version,
-            origin: format!("{origin_base}:{line}"),
-            git_url: None,
+    let mut push =
+        |name: &str, kind: DepKind, required: bool, version: Option<String>, line: usize| {
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+            {
+                return;
+            }
+            let norm = normalize_name(name);
+            if CMAKE_BUILTINS.contains(&norm.as_str()) {
+                return; // toolchain-provided (threads, python interpreter, ...)
+            }
+            let d = DeclaredDep {
+                name: name.to_string(),
+                name_norm: norm,
+                kind,
+                required,
+                version,
+                origin: format!("{origin_base}:{line}"),
+                git_url: None,
+            };
+            if required {
+                deps.required.push(d);
+            } else {
+                deps.optional.push(d);
+            }
         };
-        if required {
-            deps.required.push(d);
-        } else {
-            deps.optional.push(d);
-        }
-    };
 
     // find_package(Name [version] [REQUIRED|OPTIONAL] [COMPONENTS ...])
     let mut idx = 0usize;
@@ -557,7 +618,16 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
                     in_names = true;
                     continue;
                 }
-                if matches!(tu.as_str(), "HINTS" | "PATHS" | "PATH_SUFFIXES" | "DOC" | "REQUIRED" | "NO_DEFAULT_PATH" | "NAMES_PER_DIR") {
+                if matches!(
+                    tu.as_str(),
+                    "HINTS"
+                        | "PATHS"
+                        | "PATH_SUFFIXES"
+                        | "DOC"
+                        | "REQUIRED"
+                        | "NO_DEFAULT_PATH"
+                        | "NAMES_PER_DIR"
+                ) {
                     in_names = false;
                     continue;
                 }
@@ -568,7 +638,9 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
             // bare form: find_library(VAR name)
             if names.is_empty() && toks.len() >= 2 {
                 let t = &toks[1];
-                if t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+                if t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
                     names.push(t.clone());
                 }
             }
@@ -598,7 +670,12 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
                     continue; // the version operand of a constraint
                 }
                 let tu = t.to_ascii_uppercase();
-                if tu == "IMPORTED_TARGET" || tu == "REQUIRED" || tu == "QUIET" || tu == "NO_CMAKE_PATH" || tu == "NO_CMAKE_ENVIRONMENT_PATH" {
+                if tu == "IMPORTED_TARGET"
+                    || tu == "REQUIRED"
+                    || tu == "QUIET"
+                    || tu == "NO_CMAKE_PATH"
+                    || tu == "NO_CMAKE_ENVIRONMENT_PATH"
+                {
                     continue;
                 }
                 if matches!(t.as_str(), ">=" | "<=" | "==" | "!=" | ">" | "<" | "=") {
@@ -607,7 +684,11 @@ fn parse_cmake_commands(text: &str, origin_base: &str, deps: &mut DeclaredDeps) 
                 }
                 // split off an attached version constraint
                 let (name, _ver) = split_pkg_constraint(t);
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')) {
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+                {
                     modules.push(name.to_string());
                 }
             }
@@ -667,7 +748,10 @@ fn paren_args(text: &str, pos: usize) -> Option<String> {
 fn split_pkg_constraint(tok: &str) -> (&str, Option<String>) {
     for op in [">=", "<=", "==", "!=", ">", "<", "="] {
         if let Some(p) = tok.find(op) {
-            return (&tok[..p], Some(format!("{op}{}", tok[p + op.len()..].trim())));
+            return (
+                &tok[..p],
+                Some(format!("{op}{}", tok[p + op.len()..].trim())),
+            );
         }
     }
     (tok.trim(), None)
@@ -737,9 +821,8 @@ fn scan_cargo_toml(
         None => return Ok(()),
     };
     let origin = path.strip_prefix(src).unwrap_or(path).display().to_string();
-    let doc: toml::Value = toml::from_str(&text).map_err(|e| {
-        GitfullError::Unsupported(format!("in {origin}: {e}"))
-    })?;
+    let doc: toml::Value = toml::from_str(&text)
+        .map_err(|e| GitfullError::Unsupported(format!("in {origin}: {e}")))?;
 
     // workspace members: each carries its own manifest
     if let Some(members) = doc
@@ -767,7 +850,13 @@ fn scan_cargo_toml(
     ] {
         let table = doc
             .get(table_name.split('.').next().unwrap_or(""))
-            .and_then(|t| if table_name.contains('.') { t.get("dependencies") } else { Some(t) })
+            .and_then(|t| {
+                if table_name.contains('.') {
+                    t.get("dependencies")
+                } else {
+                    Some(t)
+                }
+            })
             .and_then(|t| t.as_table())
             .cloned()
             .unwrap_or_default();
@@ -792,7 +881,10 @@ fn scan_cargo_toml(
                 if crate_name.starts_with('_') {
                     continue; // rename keys etc.
                 }
-                let git_url = spec.get("git").and_then(|g| g.as_str()).map(|s| s.to_string());
+                let git_url = spec
+                    .get("git")
+                    .and_then(|g| g.as_str())
+                    .map(|s| s.to_string());
                 let d = DeclaredDep {
                     name: crate_name.clone(),
                     name_norm: crate_name.to_ascii_lowercase(),
@@ -803,7 +895,9 @@ fn scan_cargo_toml(
                     },
                     required: !is_dev,
                     version: spec.as_str().map(|s| s.to_string()).or_else(|| {
-                        spec.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        spec.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
                     }),
                     origin: origin.clone(),
                     git_url,
@@ -877,7 +971,9 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                 let (name, ver2) = split_pkg_constraint(t);
                 let norm = normalize_name(name);
                 if norm.is_empty()
-                    || !norm.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+                    || !norm
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
                 {
                     continue;
                 }
@@ -924,7 +1020,10 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
                     if norm.is_empty() || LIBC_LIBS.contains(&norm.as_str()) {
                         continue;
                     }
-                    if !norm.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')) {
+                    if !norm
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+                    {
                         continue;
                     }
                     deps.required.push(DeclaredDep {
@@ -950,9 +1049,7 @@ fn scan_autotools(src: &Path) -> Result<DeclaredDeps> {
 fn m4_args(text: &str, pos: usize) -> Option<Vec<String>> {
     let bytes = text.as_bytes();
     let mut i = pos;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-    {
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
         i += 1;
     }
     while i < bytes.len() && (bytes[i] as char).is_whitespace() {
@@ -1013,7 +1110,13 @@ fn scan_make(src: &Path) -> Result<DeclaredDeps> {
         // and variables precede the invocation and are excluded naturally.
         let sanitized: String = line
             .chars()
-            .map(|c| if matches!(c, '(' | ')' | '$' | '"' | '\'') { ' ' } else { c })
+            .map(|c| {
+                if matches!(c, '(' | ')' | '$' | '"' | '\'') {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .collect();
         let toks: Vec<&str> = sanitized.split_whitespace().collect();
         let Some(pc) = toks
@@ -1040,7 +1143,9 @@ fn scan_make(src: &Path) -> Result<DeclaredDeps> {
             let (name, _) = split_pkg_constraint(tok);
             let norm = normalize_name(name);
             if norm.is_empty()
-                || !norm.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+                || !norm
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
             {
                 continue;
             }
@@ -1140,7 +1245,12 @@ cc = meson.get_compiler('c')
             names(&deps.required),
             // harfbuzz deduped? no — appears once. Sorted set:
             vec![
-                "cairo", "glib-2.0", "harfbuzz", "libpng", "libxml-2.0", "zlib"
+                "cairo",
+                "glib-2.0",
+                "harfbuzz",
+                "libpng",
+                "libxml-2.0",
+                "zlib"
             ]
         );
         // optional deps are reported, never provisioned
@@ -1163,7 +1273,11 @@ cc = meson.get_compiler('c')
     #[test]
     fn meson_wraps_and_vendored_subprojects() {
         let d = tmpdir("wraps");
-        fs::write(d.join("meson.build"), "project('w')\nz = dependency('zlib')\n").unwrap();
+        fs::write(
+            d.join("meson.build"),
+            "project('w')\nz = dependency('zlib')\n",
+        )
+        .unwrap();
         fs::create_dir_all(d.join("subprojects")).unwrap();
         // wrap-git with a [provide] section (modern wrap-db style)
         fs::write(
@@ -1192,7 +1306,11 @@ patch_url = https://example.com/somelib-2.3-patch.tar.gz
         .unwrap();
         // vendored subproject: a checked-in tree, not a wrap
         fs::create_dir_all(d.join("subprojects/vendored-thing")).unwrap();
-        fs::write(d.join("subprojects/vendored-thing/meson.build"), "project('v')\n").unwrap();
+        fs::write(
+            d.join("subprojects/vendored-thing/meson.build"),
+            "project('v')\n",
+        )
+        .unwrap();
 
         let deps = scan(&d, BuildSystem::Meson).unwrap();
         assert_eq!(deps.wraps.len(), 2, "{:?}", deps.wraps);
@@ -1208,12 +1326,373 @@ patch_url = https://example.com/somelib-2.3-patch.tar.gz
         let s = deps.wraps.iter().find(|w| w.name == "somelib").unwrap();
         assert_eq!(
             s.file.as_ref().map(|(u, p)| (u.as_str(), p.clone())),
-            Some(("https://example.com/somelib-2.3.tar.gz", Some("https://example.com/somelib-2.3-patch.tar.gz".to_string())))
+            Some((
+                "https://example.com/somelib-2.3.tar.gz",
+                Some("https://example.com/somelib-2.3-patch.tar.gz".to_string())
+            ))
         );
         // vendored dirs are recorded (nothing must be fetched for them)
         assert!(deps.vendored.contains(&"vendored-thing".to_string()));
         // wrap-provided names are queryable
         assert!(deps.wrap_provided().contains("zlib"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ---- meson: platform-conditional dependency() calls --------------------
+    //
+    // The same fixture is scanned for several target platforms: a gated
+    // dependency must disappear when the platform does not match and
+    // reappear when it does — proving the exclusion follows meson's
+    // conditional semantics, not any dependency NAME.
+
+    fn write_platform_gated_fixture(d: &Path) {
+        fs::write(
+            d.join("meson.build"),
+            r#"project('cross-app', 'c')
+
+host_system = host_machine.system()
+
+if host_machine.system() == 'darwin'
+  framework_dep = dependency('appleframeworks', modules : ['Foundation', 'CoreFoundation'])
+endif
+
+if build_machine.system() == 'windows'
+  dwrite_dep = dependency('dwrite')
+endif
+
+if target_machine.system() not in ['windows', 'darwin']
+  posix_dep = dependency('libudev')
+endif
+
+if host_system == 'linux'
+  systemd_dep = dependency('libsystemd')
+endif
+
+always = dependency('zlib')
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn meson_platform_gated_deps_excluded_on_linux() {
+        let d = tmpdir("meson-gated-linux");
+        write_platform_gated_fixture(&d);
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libsystemd", "libudev", "zlib"]);
+        // the whole point: darwin/windows-gated names never surface
+        for gone in ["appleframeworks", "dwrite"] {
+            assert!(
+                !deps
+                    .required
+                    .iter()
+                    .chain(deps.optional.iter())
+                    .any(|x| x.name_norm == gone),
+                "{gone} must not appear on a Linux scan"
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_platform_gated_deps_included_on_matching_platform() {
+        // the SAME fixture, scanned as its gated platforms: each gated
+        // dependency returns exactly when its condition holds — this is
+        // what proves the exclusion is conditional, not name-based
+        let d = tmpdir("meson-gated-darwin");
+        write_platform_gated_fixture(&d);
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(names(&deps.required), vec!["appleframeworks", "zlib"]);
+        let _ = fs::remove_dir_all(&d);
+
+        let d = tmpdir("meson-gated-windows");
+        write_platform_gated_fixture(&d);
+        let deps = scan_meson_for(&d, "windows").unwrap();
+        assert_eq!(names(&deps.required), vec!["dwrite", "zlib"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_if_elif_else_chain_selects_platform_branch() {
+        let chain = r#"project('chained', 'c')
+host_system = host_machine.system()
+if host_system == 'darwin'
+  a = dependency('appleframeworks')
+elif host_system == 'windows'
+  w = dependency('dwrite')
+elif host_system == 'linux'
+  l = dependency('libudev')
+else
+  o = dependency('libgen')
+endif
+base = dependency('zlib')
+"#;
+        for (system, expected) in [
+            ("linux", vec!["libudev", "zlib"]),
+            ("windows", vec!["dwrite", "zlib"]),
+            ("darwin", vec!["appleframeworks", "zlib"]),
+            // no branch matched: the else branch is the live one
+            ("freebsd", vec!["libgen", "zlib"]),
+        ] {
+            let d = tmpdir("meson-chain");
+            fs::write(d.join("meson.build"), chain).unwrap();
+            let deps = scan_meson_for(&d, system).unwrap();
+            assert_eq!(names(&deps.required), expected, "system={system}");
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn meson_unknown_conditions_stay_included() {
+        // conditions gitfull cannot decide statically (options, compiler
+        // probes) are conservatively reachable: the branch MIGHT run
+        let d = tmpdir("meson-unknown");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('unknowns', 'c')
+opt = get_option('feature')
+if opt.enabled()
+  a = dependency('libextra')
+endif
+if get_option('other').disabled()
+  b = dependency('libother')
+endif
+cc = meson.get_compiler('c')
+if cc.compiles('int main(){return 0;}')
+  c = dependency('libprobe')
+endif
+d = dependency('zlib')
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(
+            names(&deps.required),
+            vec!["libextra", "libother", "libprobe", "zlib"]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_else_of_unknown_condition_stays_included() {
+        // an undecided `if` means BOTH branches might run — the else of
+        // an unknown condition must never be dropped
+        let d = tmpdir("meson-else-unknown");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('elseu', 'c')
+mode = get_option('backend')
+if mode == 'gtk'
+  g = dependency('gtk4')
+else
+  o = dependency('qt6')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["gtk4", "qt6"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_platform_flag_propagates_across_subdir_scope() {
+        // the shape real upstreams use (GLib): the ROOT file computes a
+        // platform flag; subdir()'d files — which meson executes in the
+        // SAME variable scope — gate framework dependencies on it. The
+        // assignment inside the darwin block must be ignored on Linux,
+        // so the subdir's `if have_fw` is provably dead there.
+        let root = r#"project('scoped', 'c')
+host_system = host_machine.system()
+have_fw = false
+if host_system == 'darwin'
+  have_fw = true
+endif
+subdir('src')
+base = dependency('zlib')
+"#;
+        let child = r#"if have_fw
+  fw_dep = dependency('appleframeworks', modules : ['Foundation'])
+endif
+plain = dependency('json-c')
+"#;
+        let d = tmpdir("meson-subdir-scope");
+        fs::write(d.join("meson.build"), root).unwrap();
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("src/meson.build"), child).unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["json-c", "zlib"]);
+        let _ = fs::remove_dir_all(&d);
+
+        // and on darwin the flag flips true and the dep reappears —
+        // again: conditional reasoning, not a name list
+        let d = tmpdir("meson-subdir-scope-darwin");
+        fs::write(d.join("meson.build"), root).unwrap();
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("src/meson.build"), child).unwrap();
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(
+            names(&deps.required),
+            vec!["appleframeworks", "json-c", "zlib"]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_and_or_not_tri_state_with_unknown_options() {
+        // cairo/harfbuzz shape: platform check AND-ed with an option
+        // probe. On a non-matching platform the whole conjunction is
+        // provably false; on the matching platform it stays unknown
+        // (reachable).
+        let d = tmpdir("meson-tri");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('tri', 'c')
+host_system = host_machine.system()
+if host_system == 'darwin' and not get_option('quartz').disabled()
+  q_dep = dependency('appleframeworks')
+endif
+if host_system == 'linux' or host_system == 'freebsd'
+  un = dependency('libunwind')
+endif
+if not host_system == 'windows'
+  n = dependency('libnih')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libnih", "libunwind"]);
+        let _ = fs::remove_dir_all(&d);
+
+        let d = tmpdir("meson-tri-darwin");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('tri', 'c')
+host_system = host_machine.system()
+if host_system == 'darwin' and not get_option('quartz').disabled()
+  q_dep = dependency('appleframeworks')
+endif
+if host_system == 'linux' or host_system == 'freebsd'
+  un = dependency('libunwind')
+endif
+if not host_system == 'windows'
+  n = dependency('libnih')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(
+            names(&deps.required),
+            // appleframeworks back: True and not Unknown -> Unknown -> reachable
+            vec!["appleframeworks", "libnih"]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_array_contains_gating() {
+        let body = r#"project('contains', 'c')
+host_system = host_machine.system()
+unixy = ['linux', 'freebsd', 'openbsd']
+if unixy.contains(host_system)
+  u = dependency('libudev')
+endif
+if not unixy.contains(host_system)
+  n = dependency('appleframeworks')
+endif
+"#;
+        let d = tmpdir("meson-contains");
+        fs::write(d.join("meson.build"), body).unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libudev"]);
+        let _ = fs::remove_dir_all(&d);
+
+        let d = tmpdir("meson-contains-darwin");
+        fs::write(d.join("meson.build"), body).unwrap();
+        let deps = scan_meson_for(&d, "darwin").unwrap();
+        assert_eq!(names(&deps.required), vec!["appleframeworks"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_dead_branch_reassignment_does_not_leak() {
+        // GLib's ios->darwin alias: an assignment inside a dead branch
+        // must not leak into the live scope (on ios the alias applies
+        // and darwin-gated deps activate — on linux it never does)
+        let body = r#"project('alias', 'c')
+host_system = host_machine.system()
+if host_system == 'ios'
+  host_system = 'darwin'
+endif
+if host_system == 'darwin'
+  fw = dependency('appleframeworks')
+endif
+z = dependency('zlib')
+"#;
+        for (system, expected) in [
+            ("linux", vec!["zlib"]),
+            ("darwin", vec!["appleframeworks", "zlib"]),
+            ("ios", vec!["appleframeworks", "zlib"]),
+        ] {
+            let d = tmpdir("meson-alias");
+            fs::write(d.join("meson.build"), body).unwrap();
+            let deps = scan_meson_for(&d, system).unwrap();
+            assert_eq!(names(&deps.required), expected, "system={system}");
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn meson_multiline_strings_are_not_statements() {
+        // compiler-probe strings (GLib shape) contain fake build code —
+        // `dependency()` and `#endif` inside them are string content
+        let d = tmpdir("meson-strings");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('strs', 'c')
+host_system = host_machine.system()
+probe = cc.compiles('''#include <stdio.h>
+dependency('stringcontent')
+#if host_system == 'darwin'
+#endif''',
+  name : 'stdio probe')
+if host_system == 'linux'
+  real = dependency('libxml-2.0')
+endif
+"#,
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["libxml-2.0"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn meson_dynamic_subdir_still_scanned_with_own_conditionals() {
+        // foreach-driven subdir paths cannot be followed statically:
+        // the child is scanned with an isolated scope — unconditional
+        // deps still reported, its own platform conditionals honored
+        let d = tmpdir("meson-dyn-subdir");
+        fs::write(
+            d.join("meson.build"),
+            r#"project('dyn', 'c')
+foreach p : ['models']
+  subdir(p)
+endforeach
+base = dependency('zlib')
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(d.join("models")).unwrap();
+        fs::write(
+            d.join("models/meson.build"),
+            "m = dependency('json-c')\nif host_machine.system() == 'darwin'\n  fw = dependency('appleframeworks')\nendif\n",
+        )
+        .unwrap();
+        let deps = scan_meson_for(&d, "linux").unwrap();
+        assert_eq!(names(&deps.required), vec!["json-c", "zlib"]);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1318,13 +1797,15 @@ winapi = "0.3"
         // registry + git + build + target deps are all "required"
         assert_eq!(
             names(&deps.required),
-            vec![
-                "anyhow", "cc", "my-git-lib", "nix", "serde", "winapi"
-            ]
+            vec!["anyhow", "cc", "my-git-lib", "nix", "serde", "winapi"]
         );
         // dev-dependencies are optional (reported, never provisioned)
         assert_eq!(names(&deps.optional), vec!["criterion"]);
-        let git = deps.required.iter().find(|x| x.name == "my-git-lib").unwrap();
+        let git = deps
+            .required
+            .iter()
+            .find(|x| x.name == "my-git-lib")
+            .unwrap();
         assert_eq!(git.kind, DepKind::CrateGit);
         assert_eq!(
             git.git_url.as_deref(),
@@ -1450,8 +1931,15 @@ other:
         assert_eq!(
             names(&deps.required),
             vec![
-                "fake-gio-unix-2.0", "fake-glib-2.0", "fake-gobject-2.0", "fake-gtk4",
-                "fake-utils", "fake-zlib", "gee-0.8", "sdl3", "something-else"
+                "fake-gio-unix-2.0",
+                "fake-glib-2.0",
+                "fake-gobject-2.0",
+                "fake-gtk4",
+                "fake-utils",
+                "fake-zlib",
+                "gee-0.8",
+                "sdl3",
+                "something-else"
             ]
         );
         let _ = fs::remove_dir_all(&d);

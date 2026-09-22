@@ -39,10 +39,15 @@ src/
 │                  per-repo requirement merging, cycle detection
 ├── depgraph.rs    build-system-native dependency discovery: parses each
 │                  build system's OWN manifest format (meson
-│                  dependency()/wraps, cmake find_package()/find_library
+│                  dependency()/wraps in their conditional context,
+│                  cmake find_package()/find_library
 │                  /pkg_check_modules, Cargo.toml, configure.ac,
 │                  Makefile pkg-config calls) into declared deps —
 │                  generic across repos, no per-repo name tables
+├── mesoneval.rs   meson conditional-structure evaluation for depgraph:
+│                  if/elif/else reachability per platform (machine
+│                  system/cpu_family/endian), tri-state and/or/not,
+│                  subdir() scope sharing — provably-dead branches only
 ├── libcache.rs   shared library cache <root>/libs/: content-addressed
 │                  entries for built library deps (provides-matching,
 │                  identity lookup, transitive link closure)
@@ -257,7 +262,7 @@ like it provisions toolchain components.
 
 | build system | files parsed | declarations recognized |
 |---|---|---|
-| meson | every `meson.build`, plus `subprojects/*.wrap` | `dependency('name', …)` calls (incl. multi-line, `required: false`, `version:`); `[wrap-git]`/`[wrap-file]` subprojects (with `[provide] dependency_names`) |
+| meson | every `meson.build`, plus `subprojects/*.wrap` | `dependency('name', …)` calls (incl. multi-line, `required: false`, `version:`) **in their conditional context** — see the next section; `[wrap-git]`/`[wrap-file]` subprojects (with `[provide] dependency_names`) |
 | cmake | every `CMakeLists.txt` and `*.cmake` | `find_package(Name [ver] [REQUIRED])`, `find_library(VAR [NAMES] x …)`, `pkg_check_modules(PREFIX … module…)` |
 | cargo | `Cargo.toml` (workspace members too) | `[dependencies]` / `[build-dependencies]` / `[target.'cfg(…)'.dependencies]`; git deps carry their URL; registry deps are fetched by cargo itself |
 | autotools | `configure.ac` | `PKG_CHECK_MODULES([V], [mod >= ver …])`, `AC_CHECK_LIB`, `AC_SEARCH_LIBS` |
@@ -272,6 +277,52 @@ build-system semantics, never fetched: meson `threads`/`gtest`/…,
 cmake `Threads`/`PkgConfig`/…, autotools libc pieces (`m`, `dl`,
 `pthread`, `resolv`, …). Vendored meson subprojects (checked-in trees
 under `subprojects/`) resolve in-tree — nothing is fetched for them.
+
+### Conditional context (meson, via mesoneval.rs)
+
+`dependency()` calls are only declarations of *some* build: meson's
+`if`/`elif`/`else` blocks gate them on platform checks, build options
+and compiler probes. A call inside `if host_machine.system() ==
+'darwin'` is not a dependency of a Linux build at all — surfacing it
+(as gitfull once did: a macOS framework was flagged for a Linux
+ProtonPlus build through GLib's `if glib_have_cocoa` blocks) sends the
+resolver hunting for a platform it is not building for.
+
+`mesoneval.rs` evaluates the conditional structure of every
+`meson.build` for the platform being scanned (gitfull builds natively,
+so host/build/target machine all equal the machine running gitfull;
+macOS is `darwin` in meson's naming). The rules are strictly
+one-sided — a branch is excluded **only when its condition provably
+evaluates to false** for the scan platform:
+
+* understood: `host_machine.system()` / `build_machine` /
+  `target_machine` `.system()/.cpu_family()/.endian()` comparisons,
+  variables holding them (`host_system = host_machine.system()`),
+  boolean/string/array literals, `and`/`or`/`not` (three-valued:
+  `False and …` is false; anything undecidable is *possibly true*),
+  `in`/`not in` and `.contains()` over arrays, `if`/`elif`/`else`/
+  `endif` nesting, comments, multi-line `'''…'''` probe strings;
+* `subdir()` runs in the caller's variable scope in call order (meson
+  semantics) — the evaluator follows statically-known `subdir()`
+  targets with one shared scope, which is how real projects gate
+  subdir-file deps on root-computed platform flags (GLib's
+  `glib_have_cocoa`, computed `false` on Linux, killing its
+  `appleframeworks` calls two files away). Assignments on dead lines
+  never take effect — dead-branch reassignments cannot leak
+  (`host_system = 'darwin'` inside `if host_system == 'ios'` stays
+  Linux on Linux, and applies on iOS, exactly like meson);
+* everything statically undecidable — `get_option(...)`, compiler
+  probes, dynamic subdir paths — counts as reachable (both sides of an
+  undecided branch). Under-provisioning a real dependency breaks the
+  build; over-including an undecided one costs a report line. Files
+  not reachable through static `subdir()` calls (dynamic paths,
+  foreach-driven subdirs) are still scanned with an isolated scope.
+
+The exclusion is provably **not name-based**: the test suite scans
+the same fixtures as several platforms and asserts a gated dependency
+vanishes when its platform does not match and reappears when it does
+(the macOS framework dep comes back on a `darwin` scan of the very
+fixture it is excluded from on Linux).
 
 ### Generality constraint (by design, enforced by tests)
 

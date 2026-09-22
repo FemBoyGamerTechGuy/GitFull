@@ -44,6 +44,7 @@ pub mod json;
 pub mod libcache;
 pub mod libmap;
 pub mod manifest;
+pub mod mesoneval;
 pub mod planner;
 pub mod privilege;
 pub mod progress;
